@@ -1,0 +1,83 @@
+seed: 1337
+device: cpu
+data:
+  dataset: echonet
+  root: data/echonet
+  frames_per_clip: 16
+  frame_size: 128
+  fps_subsample: 2
+  grayscale: true
+
+synthesis:
+  p_apply: 1.0
+  gain_min: 0.6
+  gain_max: 1.6
+  gain_sigma: 0.03
+
+  tgc_K: 6
+  tgc_sigma: 0.02
+  clip_low_min: 0.00
+  clip_low_max: 0.05
+  clip_high_min: 0.90
+  clip_high_max: 0.99
+  add_noise_std: 0.01
+  add_noise_mult: 0.02
+
+  # TGC / band style: set to "bands" (default) or "ramp" to keep old behavior
+  tgc_style: bands
+  tgc_mode: bands            # alias to keep compatibility with prior cfg keys
+
+  # band count
+  tgc_bands_min: 1
+  tgc_bands_max: 5
+
+  # how strong bands can be (fractional). 0.6 allows intensity in roughly [0.4,1.6]
+  tgc_band_strength: 1.2
+
+  # band width (fraction of radial range)
+  tgc_band_width_min: 0.03
+  tgc_band_width_max: 0.12
+
+  # probability a band is abrupt (box-like) vs smooth (Gaussian)
+  tgc_abrupt_prob: 0.45
+  tgc_abrupt_sharpness: 120.0
+
+  # lateral waviness and time jitter
+  tgc_lateral_perturb: 0.06
+  tgc_time_jitter: 0.02
+
+  # curvature center (multiplier of image height) -> >1 places circle center below image
+  tgc_curvature: 1.3
+
+  # overall TGC strength blending (0=no band effect, 1=full effect)
+  tgc_strength: 1.0
+
+train:
+  debug: true
+  amp: false
+  batch_size: 6
+  num_workers: 4
+  epochs: 10
+  lr_g: 1e-4
+  lr_d: 2e-4         # stronger D can help but watch stability
+  weight_decay: 1e-4
+  save_dir: runs/exp4
+  grad_clip: 1.0
+
+model:
+  enc_channels: [32, 64, 128]
+  n_heads: 4
+  n_layers: 2
+  lowrank_rank: 8
+  illumination_coarse: 16
+
+loss:
+  w_l1: 1.0
+  w_ssim: 0.5
+  w_tv: 0.01         # down from 0.1
+  w_identity: 0.2
+  w_lowrank_nuc: 0.005  # down from 0.05
+  lambda_adv: 0.05   # slightly stronger adv signal
+
+eval:
+  ckpt: null
