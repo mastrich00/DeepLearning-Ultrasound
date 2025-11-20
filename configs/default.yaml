@@ -32,15 +32,15 @@ synthesis:
   tgc_bands_max: 5
 
   # how strong bands can be (fractional). 0.6 allows intensity in roughly [0.4,1.6]
-  tgc_band_strength: 1.2
+  tgc_band_strength: 0.5
 
   # band width (fraction of radial range)
-  tgc_band_width_min: 0.03
-  tgc_band_width_max: 0.12
+  tgc_band_width_min: 0.06
+  tgc_band_width_max: 0.28
 
   # probability a band is abrupt (box-like) vs smooth (Gaussian)
-  tgc_abrupt_prob: 0.45
-  tgc_abrupt_sharpness: 120.0
+  tgc_abrupt_prob: 0.15
+  tgc_abrupt_sharpness: 20.0
 
   # lateral waviness and time jitter
   tgc_lateral_perturb: 0.06
@@ -50,7 +50,9 @@ synthesis:
   tgc_curvature: 1.3
 
   # overall TGC strength blending (0=no band effect, 1=full effect)
-  tgc_strength: 1.0
+  tgc_strength: 0.5
+
+  tgc_widen_factor: 1.6
 
 train:
   debug: true

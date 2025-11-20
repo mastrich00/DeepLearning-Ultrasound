@@ -56,103 +56,112 @@ def apply_synthetic_degradation(clip, cfg, rng=None):
     # config keys (defaults provided)
     tgc_style = cfg.get("tgc_mode", cfg.get("tgc_style", "bands"))
     if tgc_style == "bands":
-        # band-specific config (new keys; defaults chosen to be reasonable)
+        # ---------- U-shaped bands (convex U: left -> down -> right) ----------
+        # config keys (defaults reuse earlier names when present)
         max_bands = int(cfg.get("tgc_bands_max", cfg.get("tgc_K", 6)))
         min_bands = int(cfg.get("tgc_bands_min", 1))
         band_strength = float(cfg.get("tgc_band_strength", cfg.get("tgc_strength", 0.6)))
-        band_width_min = float(cfg.get("tgc_band_width_min", 0.03))  # fraction of radial depth
+        band_strength_max = float(cfg.get("tgc_band_strength_max", max(band_strength, 1.0)))
+        band_width_min = float(cfg.get("tgc_band_width_min", 0.03))
         band_width_max = float(cfg.get("tgc_band_width_max", 0.15))
-        abrupt_prob = float(cfg.get("tgc_abrupt_prob", 0.2))  # probability a band is abrupt
-        lateral_perturb = float(cfg.get("tgc_lateral_perturb", 0.06))  # lateral waviness amplitude
-        curvature_factor = float(cfg.get("tgc_curvature", 1.3))  # >1 centers below image
-        time_jitter = float(cfg.get("tgc_time_jitter", 0.02))  # per-frame centre jitter (fraction)
-        # compute arc center for convex probe: center_x roughly mid, center_y below image
-        cx0 = float(W / 2.0)
-        # allow small random horizontal center shift per clip
-        cx0 += float(rng.uniform(-0.05, 0.05) * W)
-        cy0 = float(H * curvature_factor)  # center below image to create convex arcs
+        abrupt_prob = float(cfg.get("tgc_abrupt_prob", 0.25))
+        abrupt_sharpness = float(cfg.get("tgc_abrupt_sharpness", 60.0))
+        lateral_perturb = float(cfg.get("tgc_lateral_perturb", 0.0))
+        time_jitter = float(cfg.get("tgc_time_jitter", 0.02))
+        contrast_exp = float(cfg.get("tgc_contrast_exponent", 1.0))
 
-        # build radial coordinate map (same for all frames except slight per-frame jitter)
-        xs = torch.linspace(0, W - 1, W, device=dev)
-        ys = torch.linspace(0, H - 1, H, device=dev)
-        # create meshgrid: y (H, W), x (H, W)
-        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-        # radial distance from probe center (float tensor, shape HxW)
-        with torch.no_grad():
-            base_radial = torch.sqrt((xx - cx0) ** 2 + (yy - cy0) ** 2)
-            # normalize radial to [0,1]
-            base_radial = (base_radial - base_radial.min()) / (base_radial.max() - base_radial.min() + 1e-12)
-
-        # number of bands this clip will have (random)
+        # sample number of bands
         n_bands = int(rng.integers(min_bands, max_bands + 1))
         band_specs = []
-        # sample band parameters (centers in normalized radial coordinates)
         for b in range(n_bands):
-            d_center = float(rng.uniform(0.05, 0.95))  # avoids extremely near-edge bands
+            # y_edge = edge height (normalized 0..1) representing the left/right start height
+            y_edge = float(rng.uniform(0.08, 0.75))  # avoid extreme top/bottom by default
+            # depth = how deep the U goes at center (normalized fraction of H)
+            depth = float(rng.uniform(0.03, 0.35))
+            # width controls vertical spread around the U-curve (fraction of H)
             width = float(rng.uniform(band_width_min, band_width_max))
-            # strength: can be >1 (bright) or <1 (dark)
-            s_sign = rng.choice([-1.0, 1.0]) if rng.random() < 0.5 else 1.0
-            # sample magnitude around band_strength, allow both dark and bright bands
-            mag = float(rng.uniform(0.2 * band_strength, band_strength))
-            intensity = 1.0 + s_sign * mag
+            # intensity magnitude (≥0): sample magnitude then allow bright/dark
+            mag = float(rng.uniform(band_strength * 0.5, band_strength_max))
+            sign = -1.0 if rng.random() < 0.5 else 1.0
+            intensity = 1.0 + sign * mag
             abrupt = rng.random() < abrupt_prob
-            band_specs.append({"center": d_center, "width": width, "intensity": intensity, "abrupt": abrupt})
+            band_specs.append({"edge": y_edge, "depth": depth, "width": width, "intensity": intensity, "abrupt": abrupt})
 
-        # create per-frame masks by combining band contributions.
+        # prepare coordinate grid once
+        xs = torch.linspace(0, W - 1, W, device=dev)
+        ys = torch.linspace(0, H - 1, H, device=dev)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")  # yy: [H,W], xx: [H,W]
+        x_norm = (xx - (W - 1) / 2.0) / ((W - 1) / 2.0)  # normalized -1 .. 1
+
         ramps = []
         for t in range(T):
-            # small temporal jitter of centers
-            radial = base_radial.clone()
-            # optional small per-frame lateral warping (sinusoidal distortions)
+            # per-frame lateral waviness optionally
+            xx_t = xx
             if lateral_perturb > 0.0:
-                # create a smooth lateral modulation field
-                freq = rng.uniform(0.5, 2.0)
-                phase = rng.uniform(0.0, 2 * np.pi)
-                lateral = (torch.sin((xx / W) * (2 * np.pi * freq) + float(phase)) * lateral_perturb)
-                radial = radial + lateral  # modulation (keeps shape HxW)
+                freq = float(rng.uniform(0.5, 2.0))
+                phase = float(rng.uniform(0.0, 2 * np.pi))
+                lateral = (torch.sin((xx / W) * (2 * np.pi * freq) + phase) * lateral_perturb * H)
+                # lateral is in pixels and added to the vertical coordinate to warp the curve
+                xx_t = xx + lateral * 0.0  # keep xx unchanged; lateral will be used by shifting x_norm below if desired
 
             total_mask = torch.ones((H, W), device=dev)
 
             for bspec in band_specs:
-                # apply tiny time jitter to band center
-                d_c = bspec["center"] + float(rng.normal(0, time_jitter))
-                d_c = float(np.clip(d_c, 0.0, 1.0))
-                w = bspec["width"]
+                # time jitter for this band center depth
+                y_edge = bspec["edge"] + float(rng.normal(0, time_jitter))
+                y_edge = float(np.clip(y_edge, 0.01, 0.95))
+                depth = bspec["depth"]
+                width = bspec["width"]
                 intensity = bspec["intensity"]
                 abrupt = bspec["abrupt"]
 
+                # compute curve y(x) in pixel coordinates:
+                # y_edge_px is the left/right start height in pixels (smaller -> shallower)
+                y_edge_px = y_edge * (H - 1)
+                depth_px = depth * (H - 1)
+                # curve: y_curve(x) = y_edge_px + depth_px * (1 - x_norm^2)
+                y_curve = y_edge_px + depth_px * (1.0 - x_norm ** 2)  # shape [H,W] but constant along rows in x
+
+                # compute vertical distance from each pixel to curve (positive when pixel is deeper than curve)
+                vdist = yy - y_curve  # shape [H,W]
+
+                # convert width fraction to pixel sigma
+                widen_factor = float(cfg.get("tgc_widen_factor", 1.6))  # default 1.6
+                sigma_pixels = max(1.0, width * H * widen_factor)
+
                 if abrupt:
-                    # box-like band with smooth edges controlled by a 'sharpness' factor
-                    sharp = float(cfg.get("tgc_abrupt_sharpness", 60.0))
-                    left = d_c - w / 2.0
-                    right = d_c + w / 2.0
-                    # smooth step using tanh
-                    left_step = 0.5 * (1.0 + torch.tanh((radial - left) * sharp))
-                    right_step = 0.5 * (1.0 + torch.tanh((radial - right) * sharp))
-                    band_mask = left_step - right_step  # ~1 inside band, 0 outside, smooth edges
-                    # convert to multiplicative factor: 1 outside, intensity inside
+                    # sharp box-like band around the curve:
+                    half_h = sigma_pixels  # use width as half height for box
+                    left = -half_h
+                    right = half_h
+                    # smooth step around vdist in pixels
+                    left_step = 0.5 * (1.0 + torch.tanh((vdist - left) * abrupt_sharpness / H))
+                    right_step = 0.5 * (1.0 + torch.tanh((vdist - right) * abrupt_sharpness / H))
+                    band_mask = left_step - right_step  # ~1 inside band, 0 outside
+                    # optionally amplify center using contrast exponent (<1 amplifies)
+                    if contrast_exp != 1.0:
+                        band_mask = torch.clamp(band_mask, 0.0, 1.0).pow(max(1e-3, contrast_exp))
                     band_mul = 1.0 + (intensity - 1.0) * band_mask
                 else:
-                    # smooth Gaussian-shaped band along radial coordinate
-                    # use gaussian sigma chosen so that width ~ 2*sqrt(2*ln2)*sigma approximately
-                    sigma = w / 2.0
-                    band_mask = torch.exp(-0.5 * ((radial - d_c) ** 2) / (sigma ** 2 + 1e-12))
+                    # smooth Gaussian band perpendicular to the curve
+                    band_mask = torch.exp(-0.5 * (vdist ** 2) / (sigma_pixels ** 2 + 1e-12))
+                    if contrast_exp != 1.0:
+                        band_mask = torch.clamp(band_mask, 0.0, 1.0).pow(max(1e-3, contrast_exp))
                     band_mul = 1.0 + (intensity - 1.0) * band_mask
 
                 total_mask = total_mask * band_mul
 
-            # clip/regularize mask so it doesn't explode; convert to shape [1,1,H,W]
-            total_mask = torch.clamp(total_mask, 0.01, 10.0).view(1, 1, H, W)
+            # clamp mask to safe numeric range and add channel/time dims
+            total_mask = torch.clamp(total_mask, 0.01, 6.0).view(1, 1, H, W)
             ramps.append(total_mask)
 
-        ramp = torch.stack(ramps, dim=0)  # shape [T,1,H,W]
-        # optionally apply an overall TGC strength factor 'a' to control global effect
-        a = float(cfg.get("tgc_strength", 0.6))
-        # blend original (1.0) with generated mask: mask = 1 + a*(mask-1)
+        ramp = torch.stack(ramps, dim=0)  # [T,1,H,W]
+        a = float(cfg.get("tgc_strength", 1.0))
         ramp = 1.0 + a * (ramp - 1.0)
-        ramp = torch.clamp(ramp, 0.2, 3.0)
-        meta["tgc_style"] = "bands"
-        meta["tgc_bands_count"] = len(band_specs)
+        ramp = torch.clamp(ramp, 0.05, 6.0)
+        meta["tgc_style"] = "bands_u"
+        meta["tgc_bands_count"] = n_bands
+
         # # optional compact summary: average band width & mean intensity
         # meta["tgc_bands_avg_width"] = float(sum(bs["width"] for bs in band_specs) / max(1, len(band_specs)))
         # meta["tgc_bands_avg_intensity"] = float(sum(bs["intensity"] for bs in band_specs) / max(1, len(band_specs)))
