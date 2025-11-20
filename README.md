@@ -16,4 +16,7 @@ python -m src.ultra_spatial.train --config configs/default.yaml --gan false --lo
 
 # with Discriminator
 python -m src.ultra_spatial.train --config configs/default.yaml --gan true --log_level INFO
+
+# visualize degraded images
+python -m src.ultra_spatial.visualize_degradation --config configs/default.yaml --out_dir runs/deg_viz --n 12
 ```
