@@ -5,3 +5,4 @@ __pycache__/
 
 runs/
 data/echonet/notUsed
+data/echonet/*.csv
