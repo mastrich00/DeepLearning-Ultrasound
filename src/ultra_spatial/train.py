@@ -25,6 +25,7 @@ matplotlib.use("Agg")   # headless backend
 import matplotlib.pyplot as plt
 import csv
 import shutil
+import time, tempfile
 
 def setup_logging(level: str = "INFO"):
     lvl = getattr(logging, level.upper(), logging.INFO)
@@ -289,6 +290,23 @@ def train_epoch(
 
 def _save_training_plots_and_csv(history, out_dir):
     os.makedirs(out_dir, exist_ok=True)
+
+    # If using distributed training, only let rank 0 write files
+    try:
+        import torch.distributed as dist
+
+        is_distributed = dist.is_available() and dist.is_initialized()
+        if is_distributed and dist.get_rank() != 0:
+            # non-main ranks skip saving
+            return
+    except Exception:
+        # if something goes wrong checking dist, continue (single-process)
+        pass
+
+    if not history or not history.get("g"):
+        print("No history to save.")
+        return
+
     epochs = list(range(1, len(history["g"]) + 1))
 
     # Loss plot
@@ -325,13 +343,24 @@ def _save_training_plots_and_csv(history, out_dir):
     fig.savefig(figpath)
     plt.close(fig)
 
-    # Save CSV log
+    # Save CSV log atomically (write to temp then replace)
     csv_path = os.path.join(out_dir, "training_log.csv")
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["epoch", "g_loss", "d_loss", "psnr", "ssim"])
-        for i in range(len(epochs)):
-            writer.writerow([i + 1, history["g"][i], history["d"][i], history["psnr"][i], history["ssim"][i]])
+    fd, tmp_path = tempfile.mkstemp(prefix="training_log_", suffix=".csv", dir=out_dir)
+    try:
+        with os.fdopen(fd, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["epoch", "g_loss", "d_loss", "psnr", "ssim"])
+            for i in range(len(epochs)):
+                writer.writerow([i + 1, history["g"][i], history["d"][i], history["psnr"][i], history["ssim"][i]])
+        # atomic replace
+        os.replace(tmp_path, csv_path)
+    except Exception as e:
+        # clean up temp file if something fails
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
 
     print(f"Saved training plots and csv to {out_dir}")
 
