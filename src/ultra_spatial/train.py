@@ -1,6 +1,7 @@
 # src/ultra_spatial/train.py
 import os, argparse, yaml, torch, logging
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 from torchvision.utils import save_image
 from tqdm import tqdm
 
@@ -43,6 +44,21 @@ def _ensure_5d(t):
     if t.dim() == 4:  # [B,C,H,W] -> add trivial time dim
         t = t[:, None]
     return t
+
+def edge_loss(pred, target):
+    # sobel kernels (1x3x3) applied per-channel via groups
+    sobel_x = torch.tensor([[-1.,0.,1.],[-2.,0.,2.],[-1.,0.,1.]], dtype=pred.dtype, device=pred.device).view(1,1,3,3)
+    sobel_y = sobel_x.transpose(-1,-2)
+    C = pred.size(1)
+    # repeat kernels across channels
+    kx = sobel_x.expand(C, -1, -1, -1)
+    ky = sobel_y.expand(C, -1, -1, -1)
+    gx_pred = F.conv2d(pred, kx, padding=1, groups=C)
+    gy_pred = F.conv2d(pred, ky, padding=1, groups=C)
+    gx_t = F.conv2d(target, kx, padding=1, groups=C)
+    gy_t = F.conv2d(target, ky, padding=1, groups=C)
+    return F.l1_loss(gx_pred, gx_t) + F.l1_loss(gy_pred, gy_t)
+
 
 def collate_keep_meta(batch):
     # batch is a list of dicts from __getitem__
@@ -143,24 +159,31 @@ def train_epoch(
 
         # --- Discriminator ---
         if use_gan:
-            with amp_ctx():
-                fake = gen(x)["corrected"].detach()
-                real = y_mid
-                D_real_map = D(real)   # shape: [B,1,Hf,Wf]
-                D_fake_map = D(fake)   # shape: [B,1,Hf,Wf]
-                # reduce spatial/patch dims to a per-sample score (keep batch dim)
-                D_real_per_sample = D_real_map.view(D_real_map.size(0), -1).mean(dim=1)
-                D_fake_per_sample = D_fake_map.view(D_fake_map.size(0), -1).mean(dim=1)
-                d_loss = hinge_d_loss(D_real_per_sample, D_fake_per_sample)
-            opt_d.zero_grad(set_to_none=True)
-            if use_amp:
-                scaler.scale(d_loss).backward()
-                scaler.step(opt_d)
-                scaler.update()
-            else:
-                d_loss.backward()
-                opt_d.step()
-            total_d += float(d_loss.detach())
+            d_steps = int(cfg.get("train", {}).get("d_steps", 1))
+            for d_iter in range(d_steps):
+                with amp_ctx():
+                    fake = gen(x)["corrected"].detach()
+                    real = y_mid
+                    D_real_map = D(real)   # shape: [B,1,Hf,Wf]
+                    D_fake_map = D(fake)   # shape: [B,1,Hf,Wf]
+                    # reduce spatial/patch dims to a per-sample score (keep batch dim)
+                    D_real_per_sample = D_real_map.view(D_real_map.size(0), -1).mean(dim=1)
+                    D_fake_per_sample = D_fake_map.view(D_fake_map.size(0), -1).mean(dim=1)
+                    d_loss = hinge_d_loss(D_real_per_sample, D_fake_per_sample)
+                opt_d.zero_grad(set_to_none=True)
+                if use_amp:
+                    scaler.scale(d_loss).backward()
+                    scaler.step(opt_d)
+                    scaler.update()
+                else:
+                    d_loss.backward()
+                    opt_d.step()
+                total_d += float(d_loss.detach())
+
+        if (i == 1) and cfg.get("train", {}).get("debug", False):
+            print("\nD_real_map mean/min/max:", float(D_real_map.detach().cpu().mean()), float(D_real_map.detach().cpu().min()), float(D_real_map.detach().cpu().max()))
+            print("\nD_fake_map mean/min/max:", float(D_fake_map.detach().cpu().mean()), float(D_fake_map.detach().cpu().min()), float(D_fake_map.detach().cpu().max()))
+
 
         # --- Generator ---
         with amp_ctx():
@@ -183,11 +206,33 @@ def train_epoch(
                 + float(w["w_lowrank_nuc"]) * nuc
                 + float(w["w_identity"]) * id_l
             )
+
+            # adversarial + feature-matching + edge loss (if GAN on)
             if use_gan:
+                # adversarial term (generator wants to maximize D(pred))
                 D_pred_map = D(pred)   # [B,1,Hf,Wf]
                 D_pred_per_sample = D_pred_map.view(D_pred_map.size(0), -1).mean(dim=1)
                 adv = hinge_g_loss(D_pred_per_sample)   # hinge_g_loss expects per-sample
-                g_loss = g_loss + float(w["lambda_adv"]) * adv
+                g_loss = g_loss + float(w.get("lambda_adv", 0.02)) * adv
+
+                # FEATURE MATCHING: compare discriminator features (stable)
+                try:
+                    feat_real = D.features(y_mid)
+                    feat_fake = D.features(pred)
+                    fm = 0.0
+                    for fr, ff in zip(feat_real, feat_fake):
+                        # per-sample spatial+channel mean (tensor shape [B])
+                        frm = fr.view(fr.size(0), -1).mean(dim=1).detach()
+                        ffm = ff.view(ff.size(0), -1).mean(dim=1)
+                        fm = fm + torch.nn.functional.l1_loss(ffm, frm)
+                    g_loss = g_loss + float(w.get("w_fm", 5.0)) * fm
+                except Exception:
+                    # if discriminator doesn't support features, skip fm
+                    pass
+
+                # EDGE LOSS - preserve gradients & speckle-like texture
+                e_l = edge_loss(pred, y_mid)
+                g_loss = g_loss + float(w.get("w_edge", 0.05)) * e_l
 
         opt_g.zero_grad(set_to_none=True)
         if use_amp:
@@ -277,10 +322,11 @@ def main(args):
     opt_g = torch.optim.AdamW(
         gen.parameters(),
         lr=float(cfg["train"]["lr_g"]),
+        betas=(0.5, 0.999),
         weight_decay=float(cfg["train"]["weight_decay"]),
     )
     opt_d = torch.optim.AdamW(
-        D.parameters(), lr=float(cfg["train"]["lr_d"]), weight_decay=0.0
+        D.parameters(), lr=float(cfg["train"]["lr_d"]), betas=(0.5, 0.999), weight_decay=0.0
     )
 
     # Create GradScaler only when AMP is actually used (prevents warnings on CPU)
