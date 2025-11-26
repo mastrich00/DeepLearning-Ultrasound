@@ -203,23 +203,27 @@ def train_epoch(
                 print(f"\npred min/max: {pmin:.6f} {pmax:.6f}")
             # compute simple per-pixel degradation mask (visual difference between input and clean)
             x_mid = x[:, x.shape[1] // 2]  # input center frame [B,C,H,W]
-            diff = torch.abs(y_mid - x_mid)  # [B,C,H,W]
-            # collapse channels to single mask magnitude
-            mask = diff.mean(dim=1, keepdim=True)  # [B,1,H,W]
-            # threshold or soft-weight: normalized mask in [0,1]
-            mask_thresh = float(cfg.get("synthesis", {}).get("mask_thresh", 0.02))
-            mask = torch.clamp((mask - mask_thresh) / (mask.max() - mask_thresh + 1e-8), 0.0, 1.0)
-            # optionally blur mask a little to not be binary (safe)
-            if mask.mean() > 0:
-                mask = torch.nn.functional.avg_pool2d(mask, kernel_size=3, stride=1, padding=1)
-
-            # compute masked L1: normalize by mask coverage to keep scale stable
-            mask_mean = mask.mean(dim=[1,2,3], keepdim=True)  # [B,1,1,1]
+            # x_mid, y_mid are [B,C,H,W]
+            eps = 1e-6
+            rel = torch.abs(y_mid - x_mid) / (torch.abs(x_mid) + eps)  # relative difference
+            mask = rel.mean(dim=1, keepdim=True)  # [B,1,H,W]
+            # lower threshold to include subtle bands, amplify mask contrast
+            mask_thresh = float(cfg.get("synthesis", {}).get("mask_thresh", 0.01))
+            mask = torch.clamp((mask - mask_thresh) / (mask.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0] + 1e-8), 0.0, 1.0)
+            # widen mask with avg_pool to make bands broader
+            widen_k = int(cfg.get("synthesis", {}).get("mask_widen", 7))
+            if widen_k > 1:
+                mask = torch.nn.functional.avg_pool2d(mask, kernel_size=widen_k, stride=1, padding=widen_k//2)
+            # normalize mask per-sample to keep loss stable
+            mask_mean = mask.mean(dim=[1,2,3], keepdim=True)
             mask_norm = mask / (mask_mean + 1e-6)
-            l1_masked = torch.abs(pred - y_mid) * mask_norm
-            l1 = l1_masked.mean()
-            # add small normal L1 to ensure background not entirely ignored
-            l1 = float(cfg["loss"].get("w_l1_bg", 0.05)) * torch.nn.functional.l1_loss(pred, y_mid) + float(cfg["loss"].get("w_l1_masked", 1.0)) * l1
+
+            # masked L1
+            l1_masked = (torch.abs(pred - y_mid) * mask_norm).mean()
+            l1_bg = torch.nn.functional.l1_loss(pred, y_mid)
+            # combine with strong masked weight, tiny background weight
+            l1 = float(cfg["loss"].get("w_l1_masked", 1.0)) * l1_masked + float(cfg["loss"].get("w_l1_bg", 0.0)) * l1_bg
+
 
             ssim_loss = 1.0 - ssim_fn(pred, y_mid)
             tv = tv_loss(out["I"])
@@ -280,9 +284,12 @@ def train_epoch(
             pbar.set_postfix(g=total_g / i, d=(total_d / i if use_gan else 0.0))
 
         if (i % cfg["train"].get("debug_step", 200) == 1) and cfg["train"].get("debug", False):
-            l1_pred_deg = torch.nn.functional.l1_loss(pred.detach(), x_mid).item()
-            l1_pred_clean = torch.nn.functional.l1_loss(pred.detach(), y_mid).item()
-            logging.info(f"L1(pred, degraded)={l1_pred_deg:.4f}, L1(pred, clean)={l1_pred_clean:.4f}, mask_mean={mask.mean().item():.4f}")
+            # baseline L1 between degraded input and clean target
+            l1_degraded = torch.nn.functional.l1_loss(x_mid.detach(), y_mid.detach()).item()
+            l1_pred_clean = torch.nn.functional.l1_loss(pred.detach(), y_mid.detach()).item()
+            impr = (l1_degraded - l1_pred_clean) / (l1_degraded + 1e-8)
+            logging.info(f"L1(deg,clean)={l1_degraded:.4f}, L1(pred,clean)={l1_pred_clean:.4f}, improvement={impr:.3f}")
+
 
     n = max(1, len(loader))
     return total_g / n, (total_d / n if use_gan else 0.0)
