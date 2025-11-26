@@ -1,5 +1,5 @@
 seed: 1337
-device: cpu
+device: cuda
 data:
   dataset: echonet
   root: data/echonet
