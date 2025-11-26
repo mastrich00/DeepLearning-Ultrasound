@@ -18,6 +18,11 @@ from .losses import (
 )
 from .metrics import psnr as psnr_fn, ssim as ssim_metric
 
+import matplotlib
+matplotlib.use("Agg")   # headless backend
+import matplotlib.pyplot as plt
+import csv
+import shutil
 
 def setup_logging(level: str = "INFO"):
     lvl = getattr(logging, level.upper(), logging.INFO)
@@ -256,6 +261,54 @@ def train_epoch(
     n = max(1, len(loader))
     return total_g / n, (total_d / n if use_gan else 0.0)
 
+def _save_training_plots_and_csv(history, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    epochs = list(range(1, len(history["g"]) + 1))
+
+    # Loss plot
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, history["g"], label="Generator loss", marker="o")
+    plt.plot(epochs, history["d"], label="Discriminator loss", marker="o")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training losses")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "losses.png"))
+    plt.close()
+
+    # Metrics plot (PSNR left, SSIM right)
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+    ax1.plot(epochs, history["psnr"], label="PSNR", marker="o")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("PSNR (dB)")
+    ax1.grid(True)
+
+    ax2 = ax1.twinx()
+    ax2.plot(epochs, history["ssim"], label="SSIM", color="tab:orange", marker="o")
+    ax2.set_ylabel("SSIM")
+
+    # build combined legend
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc="best")
+    plt.title("Validation metrics")
+    fig.tight_layout()
+    figpath = os.path.join(out_dir, "metrics.png")
+    fig.savefig(figpath)
+    plt.close(fig)
+
+    # Save CSV log
+    csv_path = os.path.join(out_dir, "training_log.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "g_loss", "d_loss", "psnr", "ssim"])
+        for i in range(len(epochs)):
+            writer.writerow([i + 1, history["g"][i], history["d"][i], history["psnr"][i], history["ssim"][i]])
+
+    print(f"Saved training plots and csv to {out_dir}")
+
 
 @torch.no_grad()
 def evaluate(cfg, device, gen, loader, epoch=None, save_dir=None):
@@ -337,6 +390,19 @@ def main(args):
         scaler = GradScaler(enabled=True)
 
     os.makedirs(cfg["train"]["save_dir"], exist_ok=True)
+    # save a copy of the exact YAML config used for this run (helps reproducibility)
+    try:
+        cfg_dst = os.path.join(cfg["train"]["save_dir"], "config_used.yaml")
+        shutil.copy2(args.config, cfg_dst)
+    except Exception as e:
+        # if copy fails (e.g. config came from stdin or is unavailable), fall back to writing parsed cfg
+        try:
+            with open(os.path.join(cfg["train"]["save_dir"], "config_used_parsed.yaml"), "w") as fh:
+                yaml.safe_dump(cfg, fh)
+        except Exception:
+            logging.warning(f"Could not save config copy: {e}")
+    # create history container for plotting
+    history = {"g": [], "d": [], "psnr": [], "ssim": []}
     samples_dir = os.path.join(cfg["train"]["save_dir"], "samples")
     best = -1.0
     for epoch in range(1, int(cfg["train"]["epochs"]) + 1):
@@ -358,6 +424,11 @@ def main(args):
         logging.info(
             f"val: psnr={val['psnr']:.3f}  ssim={val['ssim']:.4f}  G={g_loss:.4f}  D={d_loss:.4f}"
         )
+        # record epoch stats for plotting
+        history["g"].append(float(g_loss))
+        history["d"].append(float(d_loss))
+        history["psnr"].append(float(val["psnr"]))
+        history["ssim"].append(float(val["ssim"]))
 
         ckpt = {"model": gen.state_dict(), "cfg": cfg, "epoch": epoch}
         save_checkpoint(ckpt, os.path.join(cfg["train"]["save_dir"], "last.pt"))
@@ -372,6 +443,9 @@ def main(args):
     gen.load_state_dict(state["model"])
     test = evaluate(cfg, device, gen, te)
     logging.info(f"test: psnr={test['psnr']:.3f}  ssim={test['ssim']:.4f}")
+    # Save final training plots + CSV
+    _save_training_plots_and_csv(history, cfg["train"]["save_dir"])
+
 
 
 if __name__ == "__main__":
