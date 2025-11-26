@@ -59,7 +59,7 @@ train:
   amp: false
   batch_size: 6
   num_workers: 4
-  epochs: 15
+  epochs: 30
   lr_g: 1e-4
   lr_d: 2e-4         # stronger D can help but watch stability
   weight_decay: 1e-4
