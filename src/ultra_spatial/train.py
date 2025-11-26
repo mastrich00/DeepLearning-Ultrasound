@@ -390,6 +390,23 @@ def main(args):
         scaler = GradScaler(enabled=True)
 
     os.makedirs(cfg["train"]["save_dir"], exist_ok=True)
+    # write all logging output to a file in the run folder
+    try:
+        log_path = os.path.join(cfg["train"]["save_dir"], "train.log")
+        # create a file handler which logs even debug messages
+        fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        fh.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
+        fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
+        fh.setFormatter(fmt)
+        # attach to root logger so all module logging is captured
+        logging.getLogger().addHandler(fh)
+
+        # optionally capture warnings from the 'warnings' module into the logging system
+        logging.captureWarnings(True)
+
+        logging.info(f"logging to file: {log_path}")
+    except Exception as e:
+        logging.warning(f"could not create log file in {cfg['train']['save_dir']}: {e}")
     # save a copy of the exact YAML config used for this run (helps reproducibility)
     try:
         cfg_dst = os.path.join(cfg["train"]["save_dir"], "config_used.yaml")
