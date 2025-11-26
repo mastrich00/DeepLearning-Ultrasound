@@ -59,13 +59,13 @@ train:
   amp: false
   batch_size: 6
   num_workers: 4
-  epochs: 30
+  epochs: 100
   lr_g: 1e-4
-  lr_d: 2e-4         # stronger D can help but watch stability
-  weight_decay: 1e-4
+  lr_d: 1e-4         # stronger D can help but watch stability
+  weight_decay: 0 # 1e-4
   save_dir: runs/exp7_lowerIdentity_tv
   grad_clip: 1.0
-  d_steps: 2        # more D steps per G step
+  d_steps: 1        # more D steps per G step
 
 model:
   enc_channels: [32, 64, 128]
@@ -76,13 +76,15 @@ model:
 
 loss:
   w_l1: 0.25          # down from 1.0
-  w_ssim: 0.15
+  w_ssim: 0.05
   w_tv: 0.01         # down from 0.1
-  w_identity: 0.1
-  w_lowrank_nuc: 0.002  # down from 0.05
-  lambda_adv: 0.30   # slightly stronger adv signal
-  w_fm: 1.0         # feature-matching weight
-  w_edge: 0.05      # gradient/edge loss weight
+  w_identity: 0.0
+  w_lowrank_nuc: 0.000  # down from 0.05
+  lambda_adv: 1.0   # slightly stronger adv signal
+  w_fm: 0.0         # feature-matching weight
+  w_edge: 0.02      # gradient/edge loss weight
+  w_l1_masked: 1.0
+  w_l1_bg: 0.05
 
 eval:
   ckpt: null

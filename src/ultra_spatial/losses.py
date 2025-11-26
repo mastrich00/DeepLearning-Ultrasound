@@ -1,6 +1,15 @@
 import torch, torch.nn.functional as F
 from math import exp
 
+# LSGAN losses (takes per-sample scalars or maps)
+def lsgan_d_loss(real_logits, fake_logits, real_label=1.0, fake_label=0.0):
+    # real_logits/fake_logits can be [B] or [B,...]; compute MSE to labels
+    r_loss = F.mse_loss(real_logits, torch.full_like(real_logits, real_label))
+    f_loss = F.mse_loss(fake_logits, torch.full_like(fake_logits, fake_label))
+    return 0.5 * (r_loss + f_loss)
+
+def lsgan_g_loss(fake_logits, real_label=1.0):
+    return 0.5 * F.mse_loss(fake_logits, torch.full_like(fake_logits, real_label))
 
 def tv_loss(img):
     dy = torch.abs(img[:, :, 1:, :] - img[:, :, :-1, :]).mean()
