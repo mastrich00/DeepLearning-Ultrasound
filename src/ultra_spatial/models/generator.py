@@ -48,7 +48,15 @@ class RetinexLowRankVT(nn.Module):
         self.head_i = IlluminationHead(c, coarse=illumination_coarse)
         self.head_lr = LowRankHead(c, rank=lowrank_rank)
 
-        # small constant to stabilize division
+        # small conv residual head (grayscale output assumed)
+        self.head_res = nn.Sequential(
+            nn.Conv2d(c, c//2 if c//2>0 else c, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c//2 if c//2>0 else c, 1, kernel_size=1)  # output 1 channel (grayscale)
+        )
+
+        self.residual_scale = float(residual_scale)
+        # small eps
         self._eps = 1e-6
 
         # scale for the tanh residual output -> ensures residual is small
@@ -80,44 +88,38 @@ class RetinexLowRankVT(nn.Module):
         f_mid = feats[:, mid]
 
         # Raw head outputs
-        R_raw = self.head_r(f_mid)   # repurposed: residual raw map (unbounded)
+        R_raw = self.head_r(f_mid)   # reflectance "detail" map
         I_raw = self.head_i(f_mid)   # illumination map (positive)
         LR_raw = self.head_lr(f_mid) # low-rank multiplicative factor
 
-        # ----------------------------
-        # Residual (additive) prediction
-        # ----------------------------
-        # Use tanh to produce bounded residual in [-1,1] then scale to small range.
-        residual = torch.tanh(R_raw) * self.residual_scale
-        # Keep a compatibility alias "R" that previously stood for reflectance.
-        # Now "R" will contain the residual map (so older code reading "R" still gets something meaningful).
-        R = residual
+        # Constrain outputs:
+        R = torch.sigmoid(R_raw)
 
-        # - Illumination I should be positive and roughly centered around 1.
-        #   Use softplus to ensure positivity, then normalize per-sample to mean 1.
         I = torch.nn.functional.softplus(I_raw) + self._eps
         # normalize spatially so that mean(I) ~= 1 per sample
         I_mean = I.view(I.size(0), -1).mean(dim=1).view(-1, 1, 1, 1)
         I = I / (I_mean + self._eps)
 
-        # - Low-rank multiplicative factor: keep it near 1 with small dynamic range
-        #   Use sigmoid in [0,1], then scale to [0.6, 1.4] (tunable).
-        LR = torch.sigmoid(LR_raw)  # [0,1]
-        LR = 0.6 + LR * 0.8         # -> [0.6,1.4]
+        LR = torch.sigmoid(LR_raw)
+        LR = 0.6 + LR * 0.8  # -> [0.6,1.4]
 
-        # ----------------------------
-        # Final corrected image (additive residual)
-        # ----------------------------
+        # residual head -> small additive correction
+        res_raw = self.head_res(f_mid)   # shape [B,1,H,W] (assuming grayscale)
+        residual = torch.tanh(res_raw) * self.residual_scale
+
+        # stable corrected image: multiplicative Retinex then additive residual
         x_mid = clip[:, mid]  # [B,C,H,W]
+        corrected_mult = x_mid / (I * LR + self._eps)
+        corrected_mult = corrected_mult * R
 
-        # Option A (pure additive residual):
-        corrected = x_mid + residual
+        # if input has >1 channel (rare here), broadcast residual across channels
+        if corrected_mult.size(1) != residual.size(1):
+            residual_broadcast = residual.expand(-1, corrected_mult.size(1), -1, -1)
+        else:
+            residual_broadcast = residual
 
-        # Optionally, one could hybridize multiplicative heads with the residual, for example:
-        # corrected = (x_mid / (I * LR + self._eps)) * 1.0 + residual
-        # The above is commented out to keep behavior strictly additive by default.
+        corrected = corrected_mult + residual_broadcast
 
-        # final clamp as a safety
         corrected = torch.clamp(corrected, 0.0, 1.0)
 
         return {"corrected": corrected, "R": R, "residual": residual, "I": I, "LR": LR}

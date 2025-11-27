@@ -322,7 +322,14 @@ def train_epoch(
             l1_degraded = torch.nn.functional.l1_loss(x_mid.detach(), y_mid.detach()).item()
             l1_pred_clean = torch.nn.functional.l1_loss(pred.detach(), y_mid.detach()).item()
             impr = (l1_degraded - l1_pred_clean) / (l1_degraded + 1e-8)
-            logging.info(f"L1(deg,clean)={l1_degraded:.4f}, L1(pred,clean)={l1_pred_clean:.4f}, res_sup={res_sup.item():.4f}, res_mag={res_mag.item():.4f}, res_tv={res_tv.item():.4f} , improvement={impr:.3f}")
+            res = out.get("residual", None)
+            if res is not None:
+                res_mean = float(res.abs().mean().detach().cpu())
+                res_nonzero_frac = float((res.abs() > 1e-4).float().mean().detach().cpu())
+            else:
+                res_mean = 0.0
+                res_nonzero_frac = 0.0
+            logging.info(f"L1(deg,clean)={l1_degraded:.4f}, L1(pred,clean)={l1_pred_clean:.4f}, res_sup={res_sup.item():.4f}, res_mag={res_mag.item():.4f}, res_tv={res_tv.item():.4f}, res_mean={res_mean:.4f}, res_frac={res_nonzero_frac:.3f}, improvement={impr:.3f}")
 
 
     n = max(1, len(loader))
