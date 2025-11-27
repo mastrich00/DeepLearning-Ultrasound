@@ -70,6 +70,12 @@ def apply_synthetic_degradation(clip, cfg, rng=None):
         time_jitter = float(cfg.get("tgc_time_jitter", 0.02))
         contrast_exp = float(cfg.get("tgc_contrast_exponent", 1.0))
 
+        # config safety knobs to avoid full blackouts / preserve texture
+        tgc_min_mul = float(cfg.get("tgc_min_mul", 0.35))        # min multiplicative factor per-pixel
+        tgc_max_mul = float(cfg.get("tgc_max_mul", 2.0))         # max multiplicative factor per-pixel
+        tgc_min_residual = float(cfg.get("tgc_min_residual", 0.06))  # min brightness after normalization
+        tgc_preserve_blend = float(cfg.get("tgc_preserve_blend", 0.12))  # blend pre-normalized texture back
+
         # sample number of bands
         n_bands = int(rng.integers(min_bands, max_bands + 1))
         band_specs = []
@@ -158,13 +164,13 @@ def apply_synthetic_degradation(clip, cfg, rng=None):
         ramp = torch.stack(ramps, dim=0)  # [T,1,H,W]
         a = float(cfg.get("tgc_strength", 1.0))
         ramp = 1.0 + a * (ramp - 1.0)
-        ramp = torch.clamp(ramp, 0.05, 6.0)
+
+        # --- clamp per-pixel multiplicative factors to safe bounds to avoid full blackouts
+        ramp = torch.clamp(ramp, tgc_min_mul, tgc_max_mul)
+
         meta["tgc_style"] = "bands_u"
         meta["tgc_bands_count"] = n_bands
 
-        # # optional compact summary: average band width & mean intensity
-        # meta["tgc_bands_avg_width"] = float(sum(bs["width"] for bs in band_specs) / max(1, len(band_specs)))
-        # meta["tgc_bands_avg_intensity"] = float(sum(bs["intensity"] for bs in band_specs) / max(1, len(band_specs)))
     else:
         # fallback: original K-control ramp (linear / spline)
         a = cfg.get("tgc_strength", 0.6)
@@ -193,10 +199,25 @@ def apply_synthetic_degradation(clip, cfg, rng=None):
     y = torch.clamp(y * ramp, 0.0, 1.0)
     
     # ---------- brightness clipping + contrast + noise ----------
+    # store pre-normalized copy so we can blend some texture back in after normalization
+    y_pre_norm = y.clone()
+
     low = float(rng.uniform(cfg["clip_low_min"], cfg["clip_low_max"]))
     high = float(rng.uniform(cfg["clip_high_min"], cfg["clip_high_max"]))
     high = max(high, low + 0.05)
-    y = torch.clamp((y - low) / (high - low + 1e-6), 0.0, 1.0)
+    y = (y - low) / (high - low + 1e-6)
+
+    # enforce a small residual floor to prevent exact zeros (avoids full blackouts)
+    # default comes from cfg if set, else 0.06
+    tgc_min_residual = float(cfg.get("tgc_min_residual", 0.06))
+    y = torch.clamp(y, tgc_min_residual, 1.0)
+
+    # optional gentle blending with pre-normalized signal to preserve texture/speckle
+    blend_preserve = float(cfg.get("tgc_preserve_blend", 0.12))
+    if blend_preserve > 0 and 'y_pre_norm' in locals():
+        # y_pre_norm is in [0,1] from earlier clamp; blend and clamp again
+        y = torch.clamp((1.0 - blend_preserve) * y + blend_preserve * y_pre_norm, 0.0, 1.0)
+
     s_add = float(cfg.get("add_noise_std", 0.0))
     s_mult = float(cfg.get("add_noise_mult", 0.0))
     if s_add > 0:
