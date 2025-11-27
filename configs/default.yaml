@@ -93,6 +93,10 @@ loss:
   w_edge: 0.1      # gradient/edge loss weight
   w_l1_masked: 2.0
   w_l1_bg: 0.05
+  w_residual_supervised: 1.0   # supervise residual to match y-x in band regions (start ~1.0)
+  residual_masked: true        # if true, only supervise residual inside mask regions
+  w_residual_mag: 0.01         # small L1 penalty on residual magnitude (keep small)
+  w_residual_tv: 0.001         # smoothness on residual
 
 eval:
   ckpt: null

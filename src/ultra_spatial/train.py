@@ -195,7 +195,9 @@ def train_epoch(
         # --- Generator ---
         with amp_ctx():
             out = gen(x)
-            pred = out["corrected"]
+            pred = out["corrected"]              # [B,C,H,W]
+            residual = out.get("residual", None) # [B,C,H,W] if model provides it
+
             if cfg.get("train", {}).get("debug", False):
                 # detach to avoid autograd converting tensors to scalars (avoids the warning)
                 pmin = pred.detach().cpu().min().item()
@@ -228,7 +230,35 @@ def train_epoch(
             ssim_loss = 1.0 - ssim_fn(pred, y_mid)
             tv = tv_loss(out["I"])
             nuc = nuclear_norm_surrogate(out["LR"])
+
+            # ----- residual supervision & regularizers -----
+            res_sup = torch.tensor(0.0, device=pred.device)
+            res_mag = torch.tensor(0.0, device=pred.device)
+            res_tv = torch.tensor(0.0, device=pred.device)
+
+            if residual is not None:
+                # supervised target for the residual: how much we must add to x_mid to get y_mid
+                r_target = (y_mid - x_mid).detach()   # detach target (no grad)
+                # full-image L1 supervision (option)
+                if cfg["loss"].get("w_residual_supervised", 0.0) > 0.0:
+                    # masked supervision focuses supervision where synthetic bands exist:
+                    if cfg["loss"].get("residual_masked", True):
+                        res_sup = (torch.abs(residual - r_target) * mask_norm).mean()
+                    else:
+                        res_sup = torch.nn.functional.l1_loss(residual, r_target)
+
+                # sparsity / magnitude penalty (keeps residual small)
+                if cfg["loss"].get("w_residual_mag", 0.0) > 0.0:
+                    res_mag = residual.abs().mean()
+
+                # TV on residual to favor smooth additive corrections
+                if cfg["loss"].get("w_residual_tv", 0.0) > 0.0:
+                    res_tv = tv_loss(residual)
+
+            # identity loss (you already had this)
             id_l = torch.nn.functional.l1_loss(gen(y)["corrected"], y_mid)
+
+            # combine losses
             g_loss = (
                 float(w["w_l1"]) * l1
                 + float(w["w_ssim"]) * ssim_loss
@@ -237,6 +267,10 @@ def train_epoch(
                 + float(w["w_identity"]) * id_l
             )
 
+            # Add residual terms (weights are configured)
+            g_loss = g_loss + float(w.get("w_residual_supervised", 0.0)) * res_sup
+            g_loss = g_loss + float(w.get("w_residual_mag", 0.0)) * res_mag
+            g_loss = g_loss + float(w.get("w_residual_tv", 0.0)) * res_tv
             # adversarial + feature-matching + edge loss (if GAN on)
             if use_gan:
                 # adversarial term (generator wants to maximize D(pred))
@@ -288,7 +322,7 @@ def train_epoch(
             l1_degraded = torch.nn.functional.l1_loss(x_mid.detach(), y_mid.detach()).item()
             l1_pred_clean = torch.nn.functional.l1_loss(pred.detach(), y_mid.detach()).item()
             impr = (l1_degraded - l1_pred_clean) / (l1_degraded + 1e-8)
-            logging.info(f"L1(deg,clean)={l1_degraded:.4f}, L1(pred,clean)={l1_pred_clean:.4f}, improvement={impr:.3f}")
+            logging.info(f"L1(deg,clean)={l1_degraded:.4f}, L1(pred,clean)={l1_pred_clean:.4f}, res_sup={res_sup.item():.4f}, res_mag={res_mag.item():.4f}, res_tv={res_tv.item():.4f} , improvement={impr:.3f}")
 
 
     n = max(1, len(loader))
