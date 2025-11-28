@@ -74,6 +74,7 @@ train:
   save_dir: runs/exp7_lowerIdentity_tv
   grad_clip: 1.0
   d_steps: 1        # more D steps per G step
+  gan_variant: pix2pix   # options: "retinex" (default), "pix2pix"
 
 model:
   enc_channels: [32, 64, 128]

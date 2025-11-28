@@ -436,13 +436,23 @@ def main(args):
 
     tr, va, te = build_loaders(cfg, use_cuda)
 
-    gen = RetinexLowRankVT(
-        enc_channels=list(cfg["model"]["enc_channels"]),
-        n_heads=int(cfg["model"]["n_heads"]),
-        n_layers=int(cfg["model"]["n_layers"]),
-        lowrank_rank=int(cfg["model"]["lowrank_rank"]),
-        illumination_coarse=int(cfg["model"]["illumination_coarse"]),
-    ).to(device)
+    # --- generator selection: retinex (default) or pix2pix ---
+    gan_variant = cfg.get("train", {}).get("gan_variant", "retinex").lower()
+    if gan_variant == "pix2pix":
+        # dynamic import of pix2pix UNet generator
+        from .models.pix2pix import UNetGenerator
+        in_ch = 1 if bool(cfg["data"].get("grayscale", True)) else 3
+        gen = UNetGenerator(in_ch=in_ch, out_ch=in_ch, ngf=64).to(device)
+        logging.info("Using pix2pix UNet generator")
+    else:
+        gen = RetinexLowRankVT(
+            enc_channels=list(cfg["model"]["enc_channels"]),
+            n_heads=int(cfg["model"]["n_heads"]),
+            n_layers=int(cfg["model"]["n_layers"]),
+            lowrank_rank=int(cfg["model"]["lowrank_rank"]),
+            illumination_coarse=int(cfg["model"]["illumination_coarse"]),
+        ).to(device)
+        logging.info("Using RetinexLowRankVT generator (default)")
 
     D = PatchDiscriminator().to(device)
 
