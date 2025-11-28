@@ -52,6 +52,30 @@ def _ensure_5d(t):
         t = t[:, None]
     return t
 
+def _gen_forward_safe(gen_model, inp):
+    """
+    Call generator and normalize output to a dict with at least key "corrected".
+    Accepts:
+      - generator that returns a tensor -> treated as corrected image
+      - generator that returns a dict -> must contain "corrected" or a tensor-like value
+    Raises TypeError if output is unexpected.
+    """
+    out = gen_model(inp)
+    if isinstance(out, torch.Tensor):
+        return {"corrected": out}
+    if isinstance(out, dict):
+        # some generators might return keys like "pred" or "out"; prefer "corrected"
+        if "corrected" in out:
+            return out
+        # try to find the first tensor-like entry and call it corrected
+        for k, v in out.items():
+            if isinstance(v, torch.Tensor):
+                out = dict(out)  # shallow copy
+                out["corrected"] = v
+                return out
+        raise TypeError("Generator returned dict but contains no tensor output.")
+    raise TypeError("Generator must return a torch.Tensor or dict.")
+
 def edge_loss(pred, target):
     # sobel kernels (1x3x3) applied per-channel via groups
     sobel_x = torch.tensor([[-1.,0.,1.],[-2.,0.,2.],[-1.,0.,1.]], dtype=pred.dtype, device=pred.device).view(1,1,3,3)
@@ -194,9 +218,17 @@ def train_epoch(
 
         # --- Generator ---
         with amp_ctx():
-            out = gen(x)
-            pred = out["corrected"]              # [B,C,H,W]
-            residual = out.get("residual", None) # [B,C,H,W] if model provides it
+            out = _gen_forward_safe(gen, x)             # ensures dict with "corrected"
+            pred = out.get("corrected", None)           # [B,C,H,W]
+            if pred is None:
+                raise KeyError("Generator output missing 'corrected' tensor.")
+            residual = out.get("residual", None)        # optional [B,C,H,W]
+
+            # If a generator (e.g. pix2pix) outputs in [-1,1] (tanh), map to [0,1]
+            # Heuristic: if minimum < -0.01 assume tanh-style output
+            if pred.min().item() < -0.01:
+                pred = (pred + 1.0) * 0.5
+                pred = torch.clamp(pred, 0.0, 1.0)
 
             if cfg.get("train", {}).get("debug", False):
                 # detach to avoid autograd converting tensors to scalars (avoids the warning)
@@ -211,13 +243,18 @@ def train_epoch(
             mask = rel.mean(dim=1, keepdim=True)  # [B,1,H,W]
             # lower threshold to include subtle bands, amplify mask contrast
             mask_thresh = float(cfg.get("synthesis", {}).get("mask_thresh", 0.01))
-            mask = torch.clamp((mask - mask_thresh) / (mask.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0] + 1e-8), 0.0, 1.0)
+            # normalize by per-sample max over H/W safely
+            per_sample_max = mask.view(mask.size(0), -1).max(dim=1)[0].view(mask.size(0), 1, 1, 1)
+            denom = per_sample_max + 1e-8
+            mask = torch.clamp((mask - mask_thresh) / denom, 0.0, 1.0)
+
             # widen mask with avg_pool to make bands broader
             widen_k = int(cfg.get("synthesis", {}).get("mask_widen", 7))
             if widen_k > 1:
-                mask = torch.nn.functional.avg_pool2d(mask, kernel_size=widen_k, stride=1, padding=widen_k//2)
+                mask = torch.nn.functional.avg_pool2d(mask, kernel_size=widen_k, stride=1, padding=widen_k // 2)
+
             # normalize mask per-sample to keep loss stable
-            mask_mean = mask.mean(dim=[1,2,3], keepdim=True)
+            mask_mean = mask.mean(dim=[1, 2, 3], keepdim=True)
             mask_norm = mask / (mask_mean + 1e-6)
 
             # masked L1
@@ -228,8 +265,30 @@ def train_epoch(
 
 
             ssim_loss = 1.0 - ssim_fn(pred, y_mid)
-            tv = tv_loss(out["I"])
-            nuc = nuclear_norm_surrogate(out["LR"])
+
+            # TV and lowrank: only compute when generator returned the corresponding tensors.
+            # TV: prefer illumination map "I" when present (Retinex); otherwise compute TV on pred.
+            tv = torch.tensor(0.0, device=pred.device)
+            tv_input = out.get("I", None)
+            if tv_input is None:
+                try:
+                    tv = tv_loss(pred)
+                except Exception:
+                    tv = torch.tensor(0.0, device=pred.device)
+            else:
+                try:
+                    # if tv_input might be multi-scale or not normalized, guard in try/except
+                    tv = tv_loss(tv_input)
+                except Exception:
+                    tv = torch.tensor(0.0, device=pred.device)
+
+            # nuclear norm only if LR present
+            nuc = 0.0
+            if "LR" in out and out["LR"] is not None:
+                try:
+                    nuc = nuclear_norm_surrogate(out["LR"])
+                except Exception:
+                    nuc = 0.0
 
             # ----- residual supervision & regularizers -----
             res_sup = torch.tensor(0.0, device=pred.device)
@@ -239,31 +298,54 @@ def train_epoch(
             if residual is not None:
                 # supervised target for the residual: how much we must add to x_mid to get y_mid
                 r_target = (y_mid - x_mid).detach()   # detach target (no grad)
-                # full-image L1 supervision (option)
-                if cfg["loss"].get("w_residual_supervised", 0.0) > 0.0:
-                    # masked supervision focuses supervision where synthetic bands exist:
-                    if cfg["loss"].get("residual_masked", True):
-                        res_sup = (torch.abs(residual - r_target) * mask_norm).mean()
+                # ensure residual is same shape as r_target (attempt to squeeze or expand if needed)
+                if residual.shape != r_target.shape:
+                    # try to broadcast/squeeze trivial dims, otherwise skip supervised residual
+                    try:
+                        residual = residual.view(r_target.shape)
+                    except Exception:
+                        residual = None
+
+                if residual is not None:
+                    # full-image L1 supervision (option)
+                    if cfg["loss"].get("w_residual_supervised", 0.0) > 0.0:
+                        if cfg["loss"].get("residual_masked", True):
+                            res_sup = (torch.abs(residual - r_target) * mask_norm).mean()
+                        else:
+                            res_sup = torch.nn.functional.l1_loss(residual, r_target)
+
+                    # sparsity / magnitude penalty (keeps residual small)
+                    if cfg["loss"].get("w_residual_mag", 0.0) > 0.0:
+                        res_mag = residual.abs().mean()
+
+                    # TV on residual to favor smooth additive corrections
+                    if cfg["loss"].get("w_residual_tv", 0.0) > 0.0:
+                        res_tv = tv_loss(residual)
+
+            # identity loss: call generator on clean input safely (may be heavy or unsupported)
+            id_l = torch.tensor(0.0, device=pred.device)
+            if float(w.get("w_identity", 0.0)) > 0.0:
+                try:
+                    id_out = _gen_forward_safe(gen, y)
+                    id_pred = id_out.get("corrected", None)
+                    if id_pred is None:
+                        id_l = torch.tensor(0.0, device=pred.device)
                     else:
-                        res_sup = torch.nn.functional.l1_loss(residual, r_target)
+                        # if id_pred is tanh style, convert
+                        if id_pred.min().item() < -0.01:
+                            id_pred = (id_pred + 1.0) * 0.5
+                            id_pred = torch.clamp(id_pred, 0.0, 1.0)
+                        id_l = torch.nn.functional.l1_loss(id_pred, y_mid)
+                except Exception:
+                    # forward might OOM or generator might not accept clean inputs; skip identity
+                    id_l = torch.tensor(0.0, device=pred.device)
 
-                # sparsity / magnitude penalty (keeps residual small)
-                if cfg["loss"].get("w_residual_mag", 0.0) > 0.0:
-                    res_mag = residual.abs().mean()
-
-                # TV on residual to favor smooth additive corrections
-                if cfg["loss"].get("w_residual_tv", 0.0) > 0.0:
-                    res_tv = tv_loss(residual)
-
-            # identity loss (you already had this)
-            id_l = torch.nn.functional.l1_loss(gen(y)["corrected"], y_mid)
-
-            # combine losses
+            # combine base losses
             g_loss = (
                 float(w["w_l1"]) * l1
                 + float(w["w_ssim"]) * ssim_loss
-                + float(w["w_tv"]) * tv
-                + float(w["w_lowrank_nuc"]) * nuc
+                + float(w["w_tv"]) * (tv if isinstance(tv, torch.Tensor) else torch.tensor(tv, device=pred.device))
+                + float(w["w_lowrank_nuc"]) * (nuc if isinstance(nuc, torch.Tensor) else torch.tensor(nuc, device=pred.device))
                 + float(w["w_identity"]) * id_l
             )
 
