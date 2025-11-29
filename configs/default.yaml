@@ -67,14 +67,15 @@ train:
   amp: false
   batch_size: 6
   num_workers: 4
-  epochs: 200
+  epochs: 75
   lr_g: 2e-4
-  lr_d: 5e-5         # stronger D can help but watch stability
+  lr_d: 1e-4         # stronger D can help but watch stability
   weight_decay: 0 # 1e-4
   save_dir: runs/exp7_lowerIdentity_tv
   grad_clip: 1.0
   d_steps: 1        # more D steps per G step
   gan_variant: pix2pix   # options: "retinex" (default), "pix2pix"
+  gan_type: lsgan        # options: "lsgan", "hinge"
 
 model:
   enc_channels: [32, 64, 128]
@@ -84,13 +85,13 @@ model:
   illumination_coarse: 16
 
 loss:
-  w_l1: 1.0          # down from 1.0
+  w_l1: 0.05         # down from 1.0
   w_ssim: 0.00
   w_tv: 0.001         # down from 0.1
   w_identity: 0.02
   w_lowrank_nuc: 0.000  # down from 0.05
-  lambda_adv: 0.05   # slightly stronger adv signal
-  w_fm: 5.0         # feature-matching weight
+  lambda_adv: 3.0  # slightly stronger adv signal
+  w_fm: 1.0         # feature-matching weight
   w_edge: 0.1      # gradient/edge loss weight
   w_l1_masked: 2.0
   w_l1_bg: 0.05

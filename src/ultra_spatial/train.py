@@ -162,6 +162,15 @@ def train_epoch(
     total_g = 0.0
     total_d = 0.0
 
+    # select GAN loss family
+    gan_type = cfg.get("train", {}).get("gan_type", "lsgan").lower()
+    if gan_type == "hinge":
+        d_loss_fn = hinge_d_loss
+        g_adv_fn = hinge_g_loss
+    else:
+        d_loss_fn = lsgan_d_loss
+        g_adv_fn = lsgan_g_loss
+
     # AMP context only when CUDA+AMP is on
     if use_amp:
         from torch.cuda.amp import autocast
@@ -188,19 +197,30 @@ def train_epoch(
         y = _ensure_5d(batch["clean"])
         y_mid = y[:, y.shape[1] // 2]
 
-        # --- Discriminator ---
+        # --- single generator forward (reuse for D and G) ---
+        with amp_ctx():
+            out = _gen_forward_safe(gen, x)             # ensures dict with "corrected"
+            pred = out.get("corrected", None)           # [B,C,H,W]
+            if pred is None:
+                raise KeyError("Generator output missing 'corrected' tensor.")
+            # convert tanh->[0,1] if generator used tanh for direct output
+            if pred.min().item() < -0.01:
+                pred = (pred + 1.0) * 0.5
+                pred = torch.clamp(pred, 0.0, 1.0)
+
+        # --- Discriminator steps (use detached fake) ---
         if use_gan:
             d_steps = int(cfg.get("train", {}).get("d_steps", 1))
             for d_iter in range(d_steps):
                 with amp_ctx():
-                    fake = gen(x)["corrected"].detach()
+                    fake = pred.detach()
                     real = y_mid
                     D_real_map = D(real)   # shape: [B,1,Hf,Wf]
                     D_fake_map = D(fake)   # shape: [B,1,Hf,Wf]
                     # reduce spatial/patch dims to a per-sample score (keep batch dim)
                     D_real_per_sample = D_real_map.view(D_real_map.size(0), -1).mean(dim=1)
                     D_fake_per_sample = D_fake_map.view(D_fake_map.size(0), -1).mean(dim=1)
-                    d_loss = lsgan_d_loss(D_real_per_sample, D_fake_per_sample)
+                    d_loss = d_loss_fn(D_real_per_sample, D_fake_per_sample)
                 opt_d.zero_grad(set_to_none=True)
                 if use_amp:
                     scaler.scale(d_loss).backward()
@@ -212,30 +232,31 @@ def train_epoch(
                 total_d += float(d_loss.detach())
 
         if (i == 1) and cfg.get("train", {}).get("debug", False):
-            print("\nD_real_map mean/min/max:", float(D_real_map.detach().cpu().mean()), float(D_real_map.detach().cpu().min()), float(D_real_map.detach().cpu().max()))
-            print("\nD_fake_map mean/min/max:", float(D_fake_map.detach().cpu().mean()), float(D_fake_map.detach().cpu().min()), float(D_fake_map.detach().cpu().max()))
+            print(
+                "\nD_real_map mean/min/max:",
+                float(D_real_map.detach().cpu().mean()),
+                float(D_real_map.detach().cpu().min()),
+                float(D_real_map.detach().cpu().max()),
+            )
+            print(
+                "\nD_fake_map mean/min/max:",
+                float(D_fake_map.detach().cpu().mean()),
+                float(D_fake_map.detach().cpu().min()),
+                float(D_fake_map.detach().cpu().max()),
+            )
 
-
-        # --- Generator ---
+        # --- Generator loss computations (reuse `out` / `pred`) ---
         with amp_ctx():
-            out = _gen_forward_safe(gen, x)             # ensures dict with "corrected"
-            pred = out.get("corrected", None)           # [B,C,H,W]
-            if pred is None:
-                raise KeyError("Generator output missing 'corrected' tensor.")
+            # pred already computed above (with grad enabled for this scope)
             residual = out.get("residual", None)        # optional [B,C,H,W]
-
-            # If a generator (e.g. pix2pix) outputs in [-1,1] (tanh), map to [0,1]
-            # Heuristic: if minimum < -0.01 assume tanh-style output
-            if pred.min().item() < -0.01:
-                pred = (pred + 1.0) * 0.5
-                pred = torch.clamp(pred, 0.0, 1.0)
 
             if cfg.get("train", {}).get("debug", False):
                 # detach to avoid autograd converting tensors to scalars (avoids the warning)
                 pmin = pred.detach().cpu().min().item()
                 pmax = pred.detach().cpu().max().item()
                 print(f"\npred min/max: {pmin:.6f} {pmax:.6f}")
-            # compute simple per-pixel degradation mask (visual difference between input and clean)
+
+            # compute per-pixel degradation mask (visual difference between input and clean)
             x_mid = x[:, x.shape[1] // 2]  # input center frame [B,C,H,W]
             # x_mid, y_mid are [B,C,H,W]
             eps = 1e-6
@@ -243,7 +264,7 @@ def train_epoch(
             mask = rel.mean(dim=1, keepdim=True)  # [B,1,H,W]
             # lower threshold to include subtle bands, amplify mask contrast
             mask_thresh = float(cfg.get("synthesis", {}).get("mask_thresh", 0.01))
-            # normalize by per-sample max over H/W safely
+            # robust per-sample normalization by max
             per_sample_max = mask.view(mask.size(0), -1).max(dim=1)[0].view(mask.size(0), 1, 1, 1)
             denom = per_sample_max + 1e-8
             mask = torch.clamp((mask - mask_thresh) / denom, 0.0, 1.0)
@@ -296,9 +317,7 @@ def train_epoch(
             res_tv = torch.tensor(0.0, device=pred.device)
 
             if residual is not None:
-                # supervised target for the residual: how much we must add to x_mid to get y_mid
-                r_target = (y_mid - x_mid).detach()   # detach target (no grad)
-                # ensure residual is same shape as r_target (attempt to squeeze or expand if needed)
+                r_target = (y_mid - x_mid).detach()
                 if residual.shape != r_target.shape:
                     # try to broadcast/squeeze trivial dims, otherwise skip supervised residual
                     try:
@@ -328,10 +347,7 @@ def train_epoch(
                 try:
                     id_out = _gen_forward_safe(gen, y)
                     id_pred = id_out.get("corrected", None)
-                    if id_pred is None:
-                        id_l = torch.tensor(0.0, device=pred.device)
-                    else:
-                        # if id_pred is tanh style, convert
+                    if id_pred is not None:
                         if id_pred.min().item() < -0.01:
                             id_pred = (id_pred + 1.0) * 0.5
                             id_pred = torch.clamp(id_pred, 0.0, 1.0)
@@ -358,7 +374,7 @@ def train_epoch(
                 # adversarial term (generator wants to maximize D(pred))
                 D_pred_map = D(pred)   # [B,1,Hf,Wf]
                 D_pred_per_sample = D_pred_map.view(D_pred_map.size(0), -1).mean(dim=1)
-                adv = lsgan_g_loss(D_pred_per_sample)   # lsgan_g_loss expects per-sample
+                adv = g_adv_fn(D_pred_per_sample)
                 g_loss = g_loss + float(w.get("lambda_adv", 0.02)) * adv
 
                 # FEATURE MATCHING: compare discriminator features (stable)
@@ -380,19 +396,16 @@ def train_epoch(
                 e_l = edge_loss(pred, y_mid)
                 g_loss = g_loss + float(w.get("w_edge", 0.05)) * e_l
 
+        # optimizer step for generator
         opt_g.zero_grad(set_to_none=True)
         if use_amp:
             scaler.scale(g_loss).backward()
-            torch.nn.utils.clip_grad_norm_(
-                gen.parameters(), float(cfg["train"]["grad_clip"])
-            )
+            torch.nn.utils.clip_grad_norm_(gen.parameters(), float(cfg["train"]["grad_clip"]))
             scaler.step(opt_g)
             scaler.update()
         else:
             g_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                gen.parameters(), float(cfg["train"]["grad_clip"])
-            )
+            torch.nn.utils.clip_grad_norm_(gen.parameters(), float(cfg["train"]["grad_clip"]))
             opt_g.step()
         total_g += float(g_loss.detach())
 
@@ -411,8 +424,11 @@ def train_epoch(
             else:
                 res_mean = 0.0
                 res_nonzero_frac = 0.0
-            logging.info(f"L1(deg,clean)={l1_degraded:.4f}, L1(pred,clean)={l1_pred_clean:.4f}, res_sup={res_sup.item():.4f}, res_mag={res_mag.item():.4f}, res_tv={res_tv.item():.4f}, res_mean={res_mean:.4f}, res_frac={res_nonzero_frac:.3f}, improvement={impr:.3f}")
-
+            logging.info(
+                f"L1(deg,clean)={l1_degraded:.4f}, L1(pred,clean)={l1_pred_clean:.4f}, "
+                f"res_sup={res_sup.item():.4f}, res_mag={res_mag.item():.4f}, res_tv={res_tv.item():.4f}, "
+                f"res_mean={res_mean:.4f}, res_frac={res_nonzero_frac:.3f}, improvement={impr:.3f}"
+            )
 
     n = max(1, len(loader))
     return total_g / n, (total_d / n if use_gan else 0.0)
