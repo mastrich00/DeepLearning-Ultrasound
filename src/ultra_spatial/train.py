@@ -2,7 +2,7 @@
 import os, argparse, yaml, torch, logging
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
-from torchvision.utils import save_image
+from torchvision.utils import save_image, make_grid
 from tqdm import tqdm
 
 from .utils import set_seed, to_device, save_checkpoint
@@ -151,6 +151,85 @@ def save_samples(save_dir, epoch, inp, pred, gt):
     save_image(grid, path, nrow=k)  # nrow=k -> 3 rows
     print(f"saved samples -> {path}")
 
+def _collect_disc_features(D, x):
+    """
+    Return list of feature tensors produced by the discriminator for input x.
+    Prefers D.features(x) if available, otherwise uses forward-hooks on Conv2d modules.
+    Each entry in returned list has shape [B, C, H, W].
+    """
+    # try discriminator-provided features
+    try:
+        feats = D.features(x)
+        if isinstance(feats, (list, tuple)):
+            return [f.detach() for f in feats if isinstance(f, torch.Tensor)]
+        if isinstance(feats, torch.Tensor):
+            return [feats.detach()]
+    except Exception:
+        pass
+
+    # fallback: register short-lived hooks on Conv2d modules
+    acts = {}
+    hooks = []
+
+    def _make_hook(name):
+        def _hook(mod, inp, out):
+            # detach to avoid storing computational graph
+            acts[name] = out.detach()
+        return _hook
+
+    # choose a subset of conv modules to avoid huge output (first few convs)
+    # iterate until we have up to N hooks to limit overhead
+    N = 6
+    count = 0
+    for name, module in D.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            hooks.append(module.register_forward_hook(_make_hook(name)))
+            count += 1
+            if count >= N:
+                break
+
+    # run forward once to fill hooks
+    _ = D(x)
+
+    # remove hooks
+    for h in hooks:
+        h.remove()
+
+    # return features sorted by registration order
+    ordered = [acts[k] for k in sorted(acts.keys())]
+    return ordered
+
+def _save_activation_maps(feat_list, out_dir, prefix="disc", epoch=None, batch_idx=None, max_cols=4):
+    """
+    feat_list: list of tensors [B,C,H,W]
+    Saves one image per feature-tensor (channel-mean), as grid per-tensor.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    for li, feat in enumerate(feat_list):
+        # reduce channels -> mean across channels (keeps spatial structure)
+        # result shape [B,1,H,W]
+        ch_mean = feat.mean(dim=1, keepdim=True)  # [B,1,H,W]
+        # normalize each sample to 0..1 to make visualization meaningful
+        B = ch_mean.size(0)
+        imgs = []
+        for b in range(B):
+            im = ch_mean[b:b+1]  # [1,1,H,W]
+            mn = float(im.min())
+            mx = float(im.max())
+            imn = (im - mn) / (mx - mn + 1e-8)
+            imgs.append(imn)
+        imgs = torch.cat(imgs, dim=0)  # [B,1,H,W]
+        k = min(max_cols, imgs.size(0))
+        grid = make_grid(imgs[:k], nrow=k, normalize=False)  # keep already normalized
+        name = f"{prefix}_L{li:02d}"
+        if epoch is not None and batch_idx is not None:
+            fname = os.path.join(out_dir, f"{name}_e{epoch:03d}_b{batch_idx:04d}.png")
+        elif epoch is not None:
+            fname = os.path.join(out_dir, f"{name}_e{epoch:03d}.png")
+        else:
+            fname = os.path.join(out_dir, f"{name}.png")
+        save_image(grid, fname)
+
 
 def train_epoch(
     cfg, device, gen, D, opt_g, opt_d, scaler, loader, use_gan, use_amp, step_log=20
@@ -161,6 +240,9 @@ def train_epoch(
     w = cfg["loss"]
     total_g = 0.0
     total_d = 0.0
+    act_every = int(cfg.get("train", {}).get("act_save_every", 0))  # 0 = disabled
+    act_dir = os.path.join(cfg["train"]["save_dir"], "disc_acts") if cfg.get("train", {}).get("save_dir") else None
+
 
     # select GAN loss family
     gan_type = cfg.get("train", {}).get("gan_type", "lsgan").lower()
@@ -217,6 +299,29 @@ def train_epoch(
                     real = y_mid
                     D_real_map = D(real)   # shape: [B,1,Hf,Wf]
                     D_fake_map = D(fake)   # shape: [B,1,Hf,Wf]
+
+                    if act_every > 0 and (i % act_every == 0):
+                        try:
+                            # collect features for both real and fake (use only first N samples to reduce IO)
+                            # choose a small subset of the batch to visualize (e.g., first 4)
+                            sel_real = real[: min(4, real.size(0))]
+                            sel_fake = fake[: min(4, fake.size(0))]
+
+                            feats_real = _collect_disc_features(D, sel_real)
+                            feats_fake = _collect_disc_features(D, sel_fake)
+
+                            # save into run folder
+                            out_dir = act_dir or cfg["train"]["save_dir"]
+                            if out_dir is None:
+                                out_dir = "runs"
+                            # create epoch-aware subfolder if epoch available
+                            e = epoch if "epoch" in locals() else None
+
+                            _save_activation_maps(feats_real, out_dir, prefix="D_real", epoch=e, batch_idx=i)
+                            _save_activation_maps(feats_fake, out_dir, prefix="D_fake", epoch=e, batch_idx=i)
+                        except Exception as ex:
+                            # do not crash training for visualization errors
+                            logging.debug(f"Could not save discriminator activations: {ex}")
                     # reduce spatial/patch dims to a per-sample score (keep batch dim)
                     D_real_per_sample = D_real_map.view(D_real_map.size(0), -1).mean(dim=1)
                     D_fake_per_sample = D_fake_map.view(D_fake_map.size(0), -1).mean(dim=1)

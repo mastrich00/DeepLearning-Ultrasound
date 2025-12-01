@@ -76,6 +76,7 @@ train:
   d_steps: 1        # more D steps per G step
   gan_variant: retinex   # options: "retinex" (default), "pix2pix"
   gan_type: lsgan        # options: "lsgan", "hinge"
+  act_save_every: 25   # save activation maps every N training steps; 0 disables
 
 model:
   enc_channels: [32, 64, 128]
