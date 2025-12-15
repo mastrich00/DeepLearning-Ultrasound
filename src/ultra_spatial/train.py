@@ -21,12 +21,18 @@ from .losses import (
 from .metrics import psnr as psnr_fn, ssim as ssim_metric
 
 import matplotlib
-matplotlib.use("Agg")   # headless backend
+
+matplotlib.use("Agg")  # headless backend
 import matplotlib.pyplot as plt
 import csv
 import shutil
 
+
+# ---------------------------------------------------------------------
+# Logging helper
+# ---------------------------------------------------------------------
 def setup_logging(level: str = "INFO"):
+    """Configure root logger with a simple timestamped format."""
     lvl = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(
         level=lvl,
@@ -35,10 +41,15 @@ def setup_logging(level: str = "INFO"):
     )
 
 
+# ---------------------------------------------------------------------
+# Shape normalization helpers
+# ---------------------------------------------------------------------
 def _ensure_5d(t):
     """Normalize to [B,T,C,H,W]. Handles shapes like [B,T,T,1,H,W] or extra singletons."""
     if t.dim() == 6 and t.size(2) == t.size(1) and t.size(3) == 1:
+        # handle shape like [B, T, T, 1, H, W] -> pick the central duplicate axis
         t = t[:, :, 0]  # -> [B,T,1,H,W]
+    # squeeze away any singleton leading dims until 5D
     while t.dim() > 5:
         squeezed = False
         for d in range(t.dim()):
@@ -51,6 +62,7 @@ def _ensure_5d(t):
     if t.dim() == 4:  # [B,C,H,W] -> add trivial time dim
         t = t[:, None]
     return t
+
 
 def _gen_forward_safe(gen_model, inp):
     """
@@ -76,10 +88,22 @@ def _gen_forward_safe(gen_model, inp):
         raise TypeError("Generator returned dict but contains no tensor output.")
     raise TypeError("Generator must return a torch.Tensor or dict.")
 
+
+# ---------------------------------------------------------------------
+# Loss helpers
+# ---------------------------------------------------------------------
 def edge_loss(pred, target):
-    # sobel kernels (1x3x3) applied per-channel via groups
-    sobel_x = torch.tensor([[-1.,0.,1.],[-2.,0.,2.],[-1.,0.,1.]], dtype=pred.dtype, device=pred.device).view(1,1,3,3)
-    sobel_y = sobel_x.transpose(-1,-2)
+    """
+    Simple edge-preservation loss based on Sobel filter differences.
+    Computes L1 loss between gradients of pred and target, summed for x and y.
+    This encourages preservation of boundaries and fine texture.
+    """
+    sobel_x = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+        dtype=pred.dtype,
+        device=pred.device,
+    ).view(1, 1, 3, 3)
+    sobel_y = sobel_x.transpose(-1, -2)
     C = pred.size(1)
     # repeat kernels across channels
     kx = sobel_x.expand(C, -1, -1, -1)
@@ -91,8 +115,15 @@ def edge_loss(pred, target):
     return F.l1_loss(gx_pred, gx_t) + F.l1_loss(gy_pred, gy_t)
 
 
+# ---------------------------------------------------------------------
+# DataLoader collate helper
+# ---------------------------------------------------------------------
 def collate_keep_meta(batch):
-    # batch is a list of dicts from __getitem__
+    """
+    Custom collate that stacks tensor fields using default_collate but preserves
+    'meta' and 'path' as Python lists (not tensors). This is useful so we can
+    keep metadata for visualization and logging.
+    """
     out = {}
     # handle tensor fields with default_collate, but keep 'meta' as list
     # separate meta first
@@ -103,13 +134,22 @@ def collate_keep_meta(batch):
     example = {k: v for k, v in batch[0].items() if k not in ("meta", "path")}
     # use default_collate on those keys
     from torch.utils.data._utils.collate import default_collate
+
     for k in example.keys():
         out[k] = default_collate([b[k] for b in batch])
     out["meta"] = metas
     out["path"] = paths
     return out
 
+
+# ---------------------------------------------------------------------
+# Data loader factory
+# ---------------------------------------------------------------------
 def build_loaders(cfg, use_cuda):
+    """
+    Build train/val/test EchoNet data loaders using the same preprocessing and
+    synthetic-degradation pipeline as training. Prints dataset sizes.
+    """
     mk = lambda split: EchoNetClips(
         cfg["data"]["root"],
         split,
@@ -134,12 +174,13 @@ def build_loaders(cfg, use_cuda):
     return dl(tr, True), dl(va, False), dl(te, False)
 
 
+# ---------------------------------------------------------------------
+# Visualization helpers
+# ---------------------------------------------------------------------
 def save_samples(save_dir, epoch, inp, pred, gt):
     """
-    Creates a 3x4 grid:
-      Row 1: input (degraded center frames)
-      Row 2: prediction (corrected center frames)
-      Row 3: target (clean center frames)
+    Save a small sample grid for quick visual inspection.
+    The grid is arranged in 3 rows: input, prediction, ground-truth.
     """
     import os, torch
     from torchvision.utils import save_image
@@ -151,11 +192,17 @@ def save_samples(save_dir, epoch, inp, pred, gt):
     save_image(grid, path, nrow=k)  # nrow=k -> 3 rows
     print(f"saved samples -> {path}")
 
+
+# ---------------------------------------------------------------------
+# Discriminator feature visualization helpers
+# ---------------------------------------------------------------------
 def _collect_disc_features(D, x):
     """
-    Return list of feature tensors produced by the discriminator for input x.
-    Prefers D.features(x) if available, otherwise uses forward-hooks on Conv2d modules.
-    Each entry in returned list has shape [B, C, H, W].
+    Attempt to collect intermediate discriminator feature maps for feature-matching
+    visualization. Prefer D.features(x) if provided by the discriminator; otherwise
+    register short-lived forward hooks on the first few Conv2d layers.
+
+    Returns a list of tensors [B, C, H, W].
     """
     # try discriminator-provided features
     try:
@@ -175,6 +222,7 @@ def _collect_disc_features(D, x):
         def _hook(mod, inp, out):
             # detach to avoid storing computational graph
             acts[name] = out.detach()
+
         return _hook
 
     # choose a subset of conv modules to avoid huge output (first few convs)
@@ -199,10 +247,13 @@ def _collect_disc_features(D, x):
     ordered = [acts[k] for k in sorted(acts.keys())]
     return ordered
 
-def _save_activation_maps(feat_list, out_dir, prefix="disc", epoch=None, batch_idx=None, max_cols=4):
+
+def _save_activation_maps(
+    feat_list, out_dir, prefix="disc", epoch=None, batch_idx=None, max_cols=4
+):
     """
-    feat_list: list of tensors [B,C,H,W]
-    Saves one image per feature-tensor (channel-mean), as grid per-tensor.
+    Save activation maps (channel-mean) as PNG grids for inspection.
+    Each feature tensor yields a small PNG showing the mean over channels for the first few batch elements.
     """
     os.makedirs(out_dir, exist_ok=True)
     for li, feat in enumerate(feat_list):
@@ -213,7 +264,7 @@ def _save_activation_maps(feat_list, out_dir, prefix="disc", epoch=None, batch_i
         B = ch_mean.size(0)
         imgs = []
         for b in range(B):
-            im = ch_mean[b:b+1]  # [1,1,H,W]
+            im = ch_mean[b : b + 1]  # [1,1,H,W]
             mn = float(im.min())
             mx = float(im.max())
             imn = (im - mn) / (mx - mn + 1e-8)
@@ -231,9 +282,26 @@ def _save_activation_maps(feat_list, out_dir, prefix="disc", epoch=None, batch_i
         save_image(grid, fname)
 
 
+# ---------------------------------------------------------------------
+# Training epoch
+# ---------------------------------------------------------------------
 def train_epoch(
     cfg, device, gen, D, opt_g, opt_d, scaler, loader, use_gan, use_amp, step_log=20
 ):
+    """
+    One epoch of training. Handles both generator and discriminator updates.
+
+    Arguments:
+      cfg: configuration dict
+      device: torch.device
+      gen, D: models
+      opt_g, opt_d: optimizers
+      scaler: GradScaler or None (for AMP)
+      loader: data loader
+      use_gan: bool, whether to run discriminator steps
+      use_amp: bool, whether to use AMP autocast and GradScaler
+      step_log: how often to update tqdm postfix
+    """
     gen.train()
     if use_gan:
         D.train()
@@ -241,8 +309,11 @@ def train_epoch(
     total_g = 0.0
     total_d = 0.0
     act_every = int(cfg.get("train", {}).get("act_save_every", 0))  # 0 = disabled
-    act_dir = os.path.join(cfg["train"]["save_dir"], "disc_acts") if cfg.get("train", {}).get("save_dir") else None
-
+    act_dir = (
+        os.path.join(cfg["train"]["save_dir"], "disc_acts")
+        if cfg.get("train", {}).get("save_dir")
+        else None
+    )
 
     # select GAN loss family
     gan_type = cfg.get("train", {}).get("gan_type", "lsgan").lower()
@@ -274,15 +345,16 @@ def train_epoch(
 
     pbar = tqdm(loader, desc="train", dynamic_ncols=True, leave=False)
     for i, batch in enumerate(pbar, 1):
+        # move batch to device and normalize shapes
         batch = to_device(batch, device)
         x = _ensure_5d(batch["degraded"])
         y = _ensure_5d(batch["clean"])
-        y_mid = y[:, y.shape[1] // 2]
+        y_mid = y[:, y.shape[1] // 2]  # center-frame target
 
-        # --- single generator forward (reuse for D and G) ---
+        # --- Generator forward (single forward used by both D and G steps) ---
         with amp_ctx():
-            out = _gen_forward_safe(gen, x)             # ensures dict with "corrected"
-            pred = out.get("corrected", None)           # [B,C,H,W]
+            out = _gen_forward_safe(gen, x)  # normalized dict
+            pred = out.get("corrected", None)  # predicted center-frame [B,C,H,W]
             if pred is None:
                 raise KeyError("Generator output missing 'corrected' tensor.")
             # convert tanh->[0,1] if generator used tanh for direct output
@@ -290,16 +362,17 @@ def train_epoch(
                 pred = (pred + 1.0) * 0.5
                 pred = torch.clamp(pred, 0.0, 1.0)
 
-        # --- Discriminator steps (use detached fake) ---
+        # --- Discriminator updates ---
         if use_gan:
             d_steps = int(cfg.get("train", {}).get("d_steps", 1))
             for d_iter in range(d_steps):
                 with amp_ctx():
                     fake = pred.detach()
                     real = y_mid
-                    D_real_map = D(real)   # shape: [B,1,Hf,Wf]
-                    D_fake_map = D(fake)   # shape: [B,1,Hf,Wf]
+                    D_real_map = D(real)  # patch-wise realism map for real images
+                    D_fake_map = D(fake)  # same for fake images
 
+                    # optional: save discriminator activations for debugging/analysis
                     if act_every > 0 and (i % act_every == 0):
                         try:
                             # collect features for both real and fake (use only first N samples to reduce IO)
@@ -317,14 +390,32 @@ def train_epoch(
                             # create epoch-aware subfolder if epoch available
                             e = epoch if "epoch" in locals() else None
 
-                            _save_activation_maps(feats_real, out_dir, prefix="D_real", epoch=e, batch_idx=i)
-                            _save_activation_maps(feats_fake, out_dir, prefix="D_fake", epoch=e, batch_idx=i)
+                            _save_activation_maps(
+                                feats_real,
+                                out_dir,
+                                prefix="D_real",
+                                epoch=e,
+                                batch_idx=i,
+                            )
+                            _save_activation_maps(
+                                feats_fake,
+                                out_dir,
+                                prefix="D_fake",
+                                epoch=e,
+                                batch_idx=i,
+                            )
                         except Exception as ex:
                             # do not crash training for visualization errors
-                            logging.debug(f"Could not save discriminator activations: {ex}")
+                            logging.debug(
+                                f"Could not save discriminator activations: {ex}"
+                            )
                     # reduce spatial/patch dims to a per-sample score (keep batch dim)
-                    D_real_per_sample = D_real_map.view(D_real_map.size(0), -1).mean(dim=1)
-                    D_fake_per_sample = D_fake_map.view(D_fake_map.size(0), -1).mean(dim=1)
+                    D_real_per_sample = D_real_map.view(D_real_map.size(0), -1).mean(
+                        dim=1
+                    )
+                    D_fake_per_sample = D_fake_map.view(D_fake_map.size(0), -1).mean(
+                        dim=1
+                    )
                     d_loss = d_loss_fn(D_real_per_sample, D_fake_per_sample)
                 opt_d.zero_grad(set_to_none=True)
                 if use_amp:
@@ -336,6 +427,7 @@ def train_epoch(
                     opt_d.step()
                 total_d += float(d_loss.detach())
 
+        # debug printing of discriminator maps for the first iteration if debug on
         if (i == 1) and cfg.get("train", {}).get("debug", False):
             print(
                 "\nD_real_map mean/min/max:",
@@ -350,10 +442,10 @@ def train_epoch(
                 float(D_fake_map.detach().cpu().max()),
             )
 
-        # --- Generator loss computations (reuse `out` / `pred`) ---
+        # --- Generator loss composition ---
         with amp_ctx():
-            # pred already computed above (with grad enabled for this scope)
-            residual = out.get("residual", None)        # optional [B,C,H,W]
+            # optional residual output from generator (additive correction)
+            residual = out.get("residual", None)
 
             if cfg.get("train", {}).get("debug", False):
                 # detach to avoid autograd converting tensors to scalars (avoids the warning)
@@ -361,25 +453,29 @@ def train_epoch(
                 pmax = pred.detach().cpu().max().item()
                 print(f"\npred min/max: {pmin:.6f} {pmax:.6f}")
 
-            # compute per-pixel degradation mask (visual difference between input and clean)
-            x_mid = x[:, x.shape[1] // 2]  # input center frame [B,C,H,W]
-            # x_mid, y_mid are [B,C,H,W]
+            # Build a mask that highlights degraded regions (used for masked L1)
+            x_mid = x[:, x.shape[1] // 2]
             eps = 1e-6
-            rel = torch.abs(y_mid - x_mid) / (torch.abs(x_mid) + eps)  # relative difference
+            rel = torch.abs(y_mid - x_mid) / (
+                torch.abs(x_mid) + eps
+            )  # relative difference
             mask = rel.mean(dim=1, keepdim=True)  # [B,1,H,W]
             # lower threshold to include subtle bands, amplify mask contrast
             mask_thresh = float(cfg.get("synthesis", {}).get("mask_thresh", 0.01))
             # robust per-sample normalization by max
-            per_sample_max = mask.view(mask.size(0), -1).max(dim=1)[0].view(mask.size(0), 1, 1, 1)
+            per_sample_max = (
+                mask.view(mask.size(0), -1).max(dim=1)[0].view(mask.size(0), 1, 1, 1)
+            )
             denom = per_sample_max + 1e-8
             mask = torch.clamp((mask - mask_thresh) / denom, 0.0, 1.0)
 
             # widen mask with avg_pool to make bands broader
             widen_k = int(cfg.get("synthesis", {}).get("mask_widen", 7))
             if widen_k > 1:
-                mask = torch.nn.functional.avg_pool2d(mask, kernel_size=widen_k, stride=1, padding=widen_k // 2)
-
-            # normalize mask per-sample to keep loss stable
+                mask = torch.nn.functional.avg_pool2d(
+                    mask, kernel_size=widen_k, stride=1, padding=widen_k // 2
+                )
+            # normalize mask to keep losses stable across samples
             mask_mean = mask.mean(dim=[1, 2, 3], keepdim=True)
             mask_norm = mask / (mask_mean + 1e-6)
 
@@ -387,13 +483,15 @@ def train_epoch(
             l1_masked = (torch.abs(pred - y_mid) * mask_norm).mean()
             l1_bg = torch.nn.functional.l1_loss(pred, y_mid)
             # combine with strong masked weight, tiny background weight
-            l1 = float(cfg["loss"].get("w_l1_masked", 1.0)) * l1_masked + float(cfg["loss"].get("w_l1_bg", 0.0)) * l1_bg
+            l1 = (
+                float(cfg["loss"].get("w_l1_masked", 1.0)) * l1_masked
+                + float(cfg["loss"].get("w_l1_bg", 0.0)) * l1_bg
+            )
 
-
+            # structural fidelity
             ssim_loss = 1.0 - ssim_fn(pred, y_mid)
 
-            # TV and lowrank: only compute when generator returned the corresponding tensors.
-            # TV: prefer illumination map "I" when present (Retinex); otherwise compute TV on pred.
+            # total variation regularizer on illumination (or fallback on pred)
             tv = torch.tensor(0.0, device=pred.device)
             tv_input = out.get("I", None)
             if tv_input is None:
@@ -408,7 +506,7 @@ def train_epoch(
                 except Exception:
                     tv = torch.tensor(0.0, device=pred.device)
 
-            # nuclear norm only if LR present
+            # low-rank nuclear norm surrogate if LR head present
             nuc = 0.0
             if "LR" in out and out["LR"] is not None:
                 try:
@@ -416,7 +514,7 @@ def train_epoch(
                 except Exception:
                     nuc = 0.0
 
-            # ----- residual supervision & regularizers -----
+            # residual supervision and regularization (optional generator output)
             res_sup = torch.tensor(0.0, device=pred.device)
             res_mag = torch.tensor(0.0, device=pred.device)
             res_tv = torch.tensor(0.0, device=pred.device)
@@ -434,7 +532,9 @@ def train_epoch(
                     # full-image L1 supervision (option)
                     if cfg["loss"].get("w_residual_supervised", 0.0) > 0.0:
                         if cfg["loss"].get("residual_masked", True):
-                            res_sup = (torch.abs(residual - r_target) * mask_norm).mean()
+                            res_sup = (
+                                torch.abs(residual - r_target) * mask_norm
+                            ).mean()
                         else:
                             res_sup = torch.nn.functional.l1_loss(residual, r_target)
 
@@ -446,7 +546,7 @@ def train_epoch(
                     if cfg["loss"].get("w_residual_tv", 0.0) > 0.0:
                         res_tv = tv_loss(residual)
 
-            # identity loss: call generator on clean input safely (may be heavy or unsupported)
+            # identity loss: check generator stability on already-clean inputs
             id_l = torch.tensor(0.0, device=pred.device)
             if float(w.get("w_identity", 0.0)) > 0.0:
                 try:
@@ -458,31 +558,42 @@ def train_epoch(
                             id_pred = torch.clamp(id_pred, 0.0, 1.0)
                         id_l = torch.nn.functional.l1_loss(id_pred, y_mid)
                 except Exception:
-                    # forward might OOM or generator might not accept clean inputs; skip identity
+                    # skip identity if forward fails (OOM or incompatible shapes)
                     id_l = torch.tensor(0.0, device=pred.device)
 
-            # combine base losses
+            # combine base losses with configured weights
             g_loss = (
                 float(w["w_l1"]) * l1
                 + float(w["w_ssim"]) * ssim_loss
-                + float(w["w_tv"]) * (tv if isinstance(tv, torch.Tensor) else torch.tensor(tv, device=pred.device))
-                + float(w["w_lowrank_nuc"]) * (nuc if isinstance(nuc, torch.Tensor) else torch.tensor(nuc, device=pred.device))
+                + float(w["w_tv"])
+                * (
+                    tv
+                    if isinstance(tv, torch.Tensor)
+                    else torch.tensor(tv, device=pred.device)
+                )
+                + float(w["w_lowrank_nuc"])
+                * (
+                    nuc
+                    if isinstance(nuc, torch.Tensor)
+                    else torch.tensor(nuc, device=pred.device)
+                )
                 + float(w["w_identity"]) * id_l
             )
 
-            # Add residual terms (weights are configured)
+            # add residual penalties if configured
             g_loss = g_loss + float(w.get("w_residual_supervised", 0.0)) * res_sup
             g_loss = g_loss + float(w.get("w_residual_mag", 0.0)) * res_mag
             g_loss = g_loss + float(w.get("w_residual_tv", 0.0)) * res_tv
-            # adversarial + feature-matching + edge loss (if GAN on)
+
+            # adversarial and auxiliary GAN-related terms
             if use_gan:
-                # adversarial term (generator wants to maximize D(pred))
-                D_pred_map = D(pred)   # [B,1,Hf,Wf]
+                # adversarial hinge or lsgan loss evaluated on D(pred)
+                D_pred_map = D(pred)
                 D_pred_per_sample = D_pred_map.view(D_pred_map.size(0), -1).mean(dim=1)
                 adv = g_adv_fn(D_pred_per_sample)
                 g_loss = g_loss + float(w.get("lambda_adv", 0.02)) * adv
 
-                # FEATURE MATCHING: compare discriminator features (stable)
+                # feature matching: compare discriminator internal features for stability
                 try:
                     feat_real = D.features(y_mid)
                     feat_fake = D.features(pred)
@@ -494,38 +605,52 @@ def train_epoch(
                         fm = fm + torch.nn.functional.l1_loss(ffm, frm)
                     g_loss = g_loss + float(w.get("w_fm", 5.0)) * fm
                 except Exception:
-                    # if discriminator doesn't support features, skip fm
+                    # ignore if D does not expose features
                     pass
 
-                # EDGE LOSS - preserve gradients & speckle-like texture
+                # edge gradient loss to encourage preserved boundaries / speckle-like gradients
                 e_l = edge_loss(pred, y_mid)
                 g_loss = g_loss + float(w.get("w_edge", 0.05)) * e_l
 
-        # optimizer step for generator
+        # --- Generator optimizer step ---
         opt_g.zero_grad(set_to_none=True)
         if use_amp:
             scaler.scale(g_loss).backward()
-            torch.nn.utils.clip_grad_norm_(gen.parameters(), float(cfg["train"]["grad_clip"]))
+            torch.nn.utils.clip_grad_norm_(
+                gen.parameters(), float(cfg["train"]["grad_clip"])
+            )
             scaler.step(opt_g)
             scaler.update()
         else:
             g_loss.backward()
-            torch.nn.utils.clip_grad_norm_(gen.parameters(), float(cfg["train"]["grad_clip"]))
+            torch.nn.utils.clip_grad_norm_(
+                gen.parameters(), float(cfg["train"]["grad_clip"])
+            )
             opt_g.step()
         total_g += float(g_loss.detach())
 
+        # update tqdm postfix periodically
         if i % step_log == 0:
             pbar.set_postfix(g=total_g / i, d=(total_d / i if use_gan else 0.0))
 
-        if (i % cfg["train"].get("debug_step", 200) == 1) and cfg["train"].get("debug", False):
+        # detailed debug logging (periodic) for diagnostics
+        if (i % cfg["train"].get("debug_step", 200) == 1) and cfg["train"].get(
+            "debug", False
+        ):
             # baseline L1 between degraded input and clean target
-            l1_degraded = torch.nn.functional.l1_loss(x_mid.detach(), y_mid.detach()).item()
-            l1_pred_clean = torch.nn.functional.l1_loss(pred.detach(), y_mid.detach()).item()
+            l1_degraded = torch.nn.functional.l1_loss(
+                x_mid.detach(), y_mid.detach()
+            ).item()
+            l1_pred_clean = torch.nn.functional.l1_loss(
+                pred.detach(), y_mid.detach()
+            ).item()
             impr = (l1_degraded - l1_pred_clean) / (l1_degraded + 1e-8)
             res = out.get("residual", None)
             if res is not None:
                 res_mean = float(res.abs().mean().detach().cpu())
-                res_nonzero_frac = float((res.abs() > 1e-4).float().mean().detach().cpu())
+                res_nonzero_frac = float(
+                    (res.abs() > 1e-4).float().mean().detach().cpu()
+                )
             else:
                 res_mean = 0.0
                 res_nonzero_frac = 0.0
@@ -538,7 +663,15 @@ def train_epoch(
     n = max(1, len(loader))
     return total_g / n, (total_d / n if use_gan else 0.0)
 
+
+# ---------------------------------------------------------------------
+# Plotting / CSV utilities for training summary
+# ---------------------------------------------------------------------
 def _save_training_plots_and_csv(history, out_dir):
+    """
+    Save training loss plot, validation metrics plot, and CSV log of epoch-wise stats.
+    'history' is expected to be a dict with keys "g", "d", "psnr", "ssim".
+    """
     os.makedirs(out_dir, exist_ok=True)
     epochs = list(range(1, len(history["g"]) + 1))
 
@@ -582,13 +715,28 @@ def _save_training_plots_and_csv(history, out_dir):
         writer = csv.writer(f)
         writer.writerow(["epoch", "g_loss", "d_loss", "psnr", "ssim"])
         for i in range(len(epochs)):
-            writer.writerow([i + 1, history["g"][i], history["d"][i], history["psnr"][i], history["ssim"][i]])
+            writer.writerow(
+                [
+                    i + 1,
+                    history["g"][i],
+                    history["d"][i],
+                    history["psnr"][i],
+                    history["ssim"][i],
+                ]
+            )
 
     print(f"Saved training plots and csv to {out_dir}")
 
 
+# ---------------------------------------------------------------------
+# Evaluation loop (no grad)
+# ---------------------------------------------------------------------
 @torch.no_grad()
 def evaluate(cfg, device, gen, loader, epoch=None, save_dir=None):
+    """
+    Run generator on validation/test loader, collect PSNR and SSIM, and save
+    the first batch as visualization using save_samples().
+    """
     gen.eval()
     psnr_list, ssim_list = [], []
     first_batch = None
@@ -624,6 +772,9 @@ def evaluate(cfg, device, gen, loader, epoch=None, save_dir=None):
     return metrics
 
 
+# ---------------------------------------------------------------------
+# Main entrypoint
+# ---------------------------------------------------------------------
 def main(args):
     setup_logging(args.log_level)
     with open(args.config, "r") as f:
@@ -642,12 +793,14 @@ def main(args):
     # --- generator selection: retinex (default) or pix2pix ---
     gan_variant = cfg.get("train", {}).get("gan_variant", "retinex").lower()
     if gan_variant == "pix2pix":
-        # dynamic import of pix2pix UNet generator
+        # optional UNet generator import if requested by config
         from .models.pix2pix import UNetGenerator
+
         in_ch = 1 if bool(cfg["data"].get("grayscale", True)) else 3
         gen = UNetGenerator(in_ch=in_ch, out_ch=in_ch, ngf=64).to(device)
         logging.info("Using pix2pix UNet generator")
     else:
+        # default RetinexLowRankVT generator (matches proposal)
         gen = RetinexLowRankVT(
             enc_channels=list(cfg["model"]["enc_channels"]),
             n_heads=int(cfg["model"]["n_heads"]),
@@ -657,8 +810,10 @@ def main(args):
         ).to(device)
         logging.info("Using RetinexLowRankVT generator (default)")
 
+    # spatial PatchGAN discriminator
     D = PatchDiscriminator().to(device)
 
+    # optimizers (AdamW with common GAN betas)
     opt_g = torch.optim.AdamW(
         gen.parameters(),
         lr=float(cfg["train"]["lr_g"]),
@@ -666,10 +821,13 @@ def main(args):
         weight_decay=float(cfg["train"]["weight_decay"]),
     )
     opt_d = torch.optim.AdamW(
-        D.parameters(), lr=float(cfg["train"]["lr_d"]), betas=(0.5, 0.999), weight_decay=0.0
+        D.parameters(),
+        lr=float(cfg["train"]["lr_d"]),
+        betas=(0.5, 0.999),
+        weight_decay=0.0,
     )
 
-    # Create GradScaler only when AMP is actually used (prevents warnings on CPU)
+    # GradScaler created only when using AMP on CUDA to avoid CPU warnings
     scaler = None
     if use_amp:
         from torch.cuda.amp import GradScaler
@@ -677,13 +835,16 @@ def main(args):
         scaler = GradScaler(enabled=True)
 
     os.makedirs(cfg["train"]["save_dir"], exist_ok=True)
-    # write all logging output to a file in the run folder
+
+    # file logging: add a FileHandler so logs are saved into the run folder
     try:
         log_path = os.path.join(cfg["train"]["save_dir"], "train.log")
         # create a file handler which logs even debug messages
         fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
         fh.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
-        fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
+        fmt = logging.Formatter(
+            "%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S"
+        )
         fh.setFormatter(fmt)
         # attach to root logger so all module logging is captured
         logging.getLogger().addHandler(fh)
@@ -694,18 +855,22 @@ def main(args):
         logging.info(f"logging to file: {log_path}")
     except Exception as e:
         logging.warning(f"could not create log file in {cfg['train']['save_dir']}: {e}")
-    # save a copy of the exact YAML config used for this run (helps reproducibility)
+
+    # save a copy of the used config for reproducibility
     try:
         cfg_dst = os.path.join(cfg["train"]["save_dir"], "config_used.yaml")
         shutil.copy2(args.config, cfg_dst)
     except Exception as e:
         # if copy fails (e.g. config came from stdin or is unavailable), fall back to writing parsed cfg
         try:
-            with open(os.path.join(cfg["train"]["save_dir"], "config_used_parsed.yaml"), "w") as fh:
+            with open(
+                os.path.join(cfg["train"]["save_dir"], "config_used_parsed.yaml"), "w"
+            ) as fh:
                 yaml.safe_dump(cfg, fh)
         except Exception:
             logging.warning(f"Could not save config copy: {e}")
-    # create history container for plotting
+
+    # history container for plotting and CSV
     history = {"g": [], "d": [], "psnr": [], "ssim": []}
     samples_dir = os.path.join(cfg["train"]["save_dir"], "samples")
     best = -1.0
@@ -728,12 +893,13 @@ def main(args):
         logging.info(
             f"val: psnr={val['psnr']:.3f}  ssim={val['ssim']:.4f}  G={g_loss:.4f}  D={d_loss:.4f}"
         )
-        # record epoch stats for plotting
+        # append epoch stats
         history["g"].append(float(g_loss))
         history["d"].append(float(d_loss))
         history["psnr"].append(float(val["psnr"]))
         history["ssim"].append(float(val["ssim"]))
 
+        # checkpoint last and best by SSIM
         ckpt = {"model": gen.state_dict(), "cfg": cfg, "epoch": epoch}
         save_checkpoint(ckpt, os.path.join(cfg["train"]["save_dir"], "last.pt"))
         if val["ssim"] > best:
@@ -741,6 +907,7 @@ def main(args):
             save_checkpoint(ckpt, os.path.join(cfg["train"]["save_dir"], "best.pt"))
             logging.info("saved new best checkpoint")
 
+    # load best and evaluate on test set
     state = torch.load(
         os.path.join(cfg["train"]["save_dir"], "best.pt"), map_location="cpu"
     )
@@ -751,12 +918,15 @@ def main(args):
     _save_training_plots_and_csv(history, cfg["train"]["save_dir"])
 
 
-
+# ---------------------------------------------------------------------
+# CLI entry
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str, default="configs/default.yaml")
 
     def str2bool(v):
+        """Flexible boolean parser for argparse (accepts many True/False strings)."""
         if isinstance(v, bool):
             return v
         v = str(v).strip().lower()
@@ -766,7 +936,14 @@ if __name__ == "__main__":
             return False
         raise argparse.ArgumentTypeError("Boolean value expected.")
 
-    p.add_argument("--gan", type=str2bool, nargs="?", const=True, default=True, help="enable GAN training (accepts yes/no/true/false; `--gan` sets True)")
+    p.add_argument(
+        "--gan",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="enable GAN training (accepts yes/no/true/false; `--gan` sets True)",
+    )
     p.add_argument("--log_level", type=str, default="INFO", help="DEBUG, INFO, WARNING")
     args = p.parse_args()
     main(args)
