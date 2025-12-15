@@ -117,7 +117,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Check that EchoNet-Dynamic videos are placed under (300 videos are already contained in the repo):
+# Check that EchoNet-Dynamic videos are placed under (500 videos are already contained in the repo):
 # data/echonet/videos/*.mp4 or *.avi
 
 # Train without adversarial loss
