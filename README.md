@@ -1,5 +1,12 @@
 # Temporal Retinex–Low-Rank Enhancement of B-mode Ultrasound Videos
 
+## Authors
+
+Group Rho (ρ):
+- Philip Donner
+- Martin Stasek
+  
+## Introduction
 This project studies automatic correction of brightness and exposure errors in B-mode ultrasound videos. The focus is on global gain and time-gain compensation (TGC), which are frequently misadjusted in practice and lead to dark regions, washed-out depth bands, and inconsistent appearance across frames. The goal is to standardize brightness across depth and time while preserving realistic speckle and anatomical boundaries.
 
 The implementation follows the proposal *"Temporal Retinex and Low-Rank Enhancement of B-mode Ultrasound Videos with Synthetic Gain/TGC Errors"* and is designed for controlled experimentation with and without adversarial training.
@@ -23,7 +30,7 @@ The model predicts a corrected center frame from a short grayscale clip.
 
 ## Dataset
 
-We use the **EchoNet-Dynamic** dataset, which contains 10,030 deidentified cardiac ultrasound videos. Each video is approximately 3 seconds long and recorded in grayscale B-mode.
+We use the **EchoNet-Dynamic** dataset, which originally contains 10,030 deidentified cardiac ultrasound videos. This repo only uses 500 videos currently. Each video is approximately 3 seconds long and recorded in grayscale B-mode.
 
 **Preprocessing**
 
