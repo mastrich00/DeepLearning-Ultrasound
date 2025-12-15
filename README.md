@@ -127,6 +127,6 @@ python -m src.ultra_spatial.visualize_degradation --config configs/default.yaml 
 
 ## References
 
-Key references include work on ultrasound knobology, speckle characterization, low-rank GANs for ultrasound, Retinex-based illumination modeling, and temporal transformers for video restoration. See the proposal bibliography for full citations.
+Key references include work on ultrasound knobology, speckle characterization, low-rank GANs for ultrasound, Retinex-based illumination modeling, and temporal transformers for video restoration. See the proposal bibliography `.\DL_Proposal.pdf` for full citations.
 
 ---
