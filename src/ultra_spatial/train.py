@@ -429,18 +429,24 @@ def train_epoch(
 
         # debug printing of discriminator maps for the first iteration if debug on
         if (i == 1) and cfg.get("train", {}).get("debug", False):
-            print(
-                "\nD_real_map mean/min/max:",
-                float(D_real_map.detach().cpu().mean()),
-                float(D_real_map.detach().cpu().min()),
-                float(D_real_map.detach().cpu().max()),
-            )
-            print(
-                "\nD_fake_map mean/min/max:",
-                float(D_fake_map.detach().cpu().mean()),
-                float(D_fake_map.detach().cpu().min()),
-                float(D_fake_map.detach().cpu().max()),
-            )
+            if use_gan:
+                # D_real_map / D_fake_map are only defined when use_gan == True
+                try:
+                    logging.info(
+                        "\nD_real_map mean/min/max: %f / %f / %f",
+                        float(D_real_map.detach().cpu().mean()),
+                        float(D_real_map.detach().cpu().min()),
+                        float(D_real_map.detach().cpu().max()),
+                    )
+                    logging.info(
+                        "\nD_fake_map mean/min/max: %f / %f / %f",
+                        float(D_fake_map.detach().cpu().mean()),
+                        float(D_fake_map.detach().cpu().min()),
+                        float(D_fake_map.detach().cpu().max()),
+                    )
+                except Exception as ex:
+                    # defensive: in case D_real_map exists but something else fails
+                    logging.debug(f"Could not log discriminator maps: {ex}")
 
         # --- Generator loss composition ---
         with amp_ctx():
