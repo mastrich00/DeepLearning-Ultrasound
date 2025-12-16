@@ -9,7 +9,7 @@ Group Rho (ρ):
 ## Introduction
 This project studies automatic correction of brightness and exposure errors in B-mode ultrasound videos. The focus is on global gain and time-gain compensation (TGC), which are frequently misadjusted in practice and lead to dark regions, washed-out depth bands, and inconsistent appearance across frames. The goal is to standardize brightness across depth and time while preserving realistic speckle and anatomical boundaries.
 
-The implementation follows the proposal *"Temporal Retinex and Low-Rank Enhancement of B-mode Ultrasound Videos with Synthetic Gain/TGC Errors"* and is designed for controlled experimentation with and without adversarial training.
+The implementation follows the proposal *"Temporal Retinex and Low-Rank Enhancement of B-mode Ultrasound Videos with Synthetic Gain/TGC Errors"* (`.\DL_Proposal.pdf`) and is designed for controlled experimentation with and without adversarial training.
 
 ---
 
@@ -99,14 +99,19 @@ We explicitly compare training **with and without GAN** to isolate the effect of
 
 ---
 
-## Expected outcomes
+## Results
 
-The method is expected to:
+The experiments show promising results. The Retinex–Low-Rank generator consistently produced less blurry corrections and fewer hallucinations than a Pix2Pix (U-Net) baseline. Quantitatively, the Retinex model achieved higher SSIM while PSNR remained essentially the same across methods. Training and discriminator loss curves were similar for both models and do not clearly reflect perceptual improvement. Pix2Pix required careful configuration to avoid very blurry outputs (using GroupNorm helped compared to InstanceNorm), but the pix2pix variants still tended to blur more and carry higher hallucination risk. These findings are reported on the subset of EchoNet videos used for the experiments (500 clips) and summarized in the presentation slides. 
 
-* improve brightness uniformity across depth and time,
-* correct underexposed and overexposed regions without clipping,
-* preserve speckle statistics and anatomical boundaries,
-* produce more perceptually realistic results when adversarial training is enabled.
+Additional practical details and failure modes observed during the experiments:
+
+* Training was run for 75 epochs with batch size 6. Each epoch took about three minutes on a Kaggle GPU for these models. 
+* Loss curves for generator and discriminator did not reliably track perceptual gains. Visual inspection and SSIM were more informative for model selection. 
+* Tuning loss weights for the Retinex + Low-Rank + GAN combination required careful manual balancing. Overly strong adversarial weighting increased risk of hallucinations. 
+
+Conclusions drawn from the results:
+
+* The Retinex + Low-Rank approach improves brightness correction while better preserving speckle and edges compared to the pix2pix baseline. 
 
 ---
 
